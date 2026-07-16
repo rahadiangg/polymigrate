@@ -133,6 +133,25 @@ func (a *bulkApplier) apply(ctx context.Context, batch []ChangeEvent) (int, int,
 	return inserts, deletes, nil
 }
 
+// codeChangeStreamHistoryLost is the MongoDB server error code (286) returned when
+// the oplog no longer retains the change-stream resume point.
+const codeChangeStreamHistoryLost = 286
+
+// isChangeStreamHistoryLost reports whether err is (or wraps) a MongoDB
+// ChangeStreamHistoryLost server error (code 286). Such an error is unrecoverable:
+// the resume token predates the oldest available oplog entry, so the stream cannot
+// resume and a fresh snapshot is required.
+func isChangeStreamHistoryLost(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se mongo.ServerError
+	if errors.As(err, &se) {
+		return se.HasErrorCode(codeChangeStreamHistoryLost)
+	}
+	return false
+}
+
 // isOnlyDuplicateKeyErrors reports whether err is a bulk-write failure whose
 // every write error is a duplicate key (code 11000). Such errors are safe to
 // ignore during an idempotent replay.

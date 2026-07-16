@@ -56,6 +56,13 @@ const (
 // duplicate key during an idempotent replay is benign and tolerated.
 const codeDuplicateKey = 11000
 
+// ErrChangeStreamHistoryLost signals that the source oplog no longer retains the
+// change-stream history needed to resume (server error 286, ChangeStreamHistoryLost).
+// It is fatal and non-resumable: the run cannot continue from its checkpoint token,
+// so the operator must start a fresh snapshot. Apply (and Open) wrap this sentinel
+// so callers can detect the condition with errors.Is and mark the run non-resumable.
+var ErrChangeStreamHistoryLost = errors.New("cdc: change stream history lost (resume point expired from the oplog)")
+
 // ChangeEvent is the in-package, driver-independent representation of a single
 // change-stream event. Keeping the tailer's logic in terms of this type (rather
 // than raw BSON or driver structs) is what lets the orchestration be unit-tested
@@ -76,6 +83,14 @@ type ChangeEvent struct {
 	Full bson.Raw
 	// At is the wall-clock approximation of the event's cluster time.
 	At time.Time
+
+	// Token is the raw BSON of the change event document's own _id, which IS this
+	// event's change-stream resume token. Checkpointing the token of the last
+	// APPLIED event lets a crashed run resume from exactly the first unapplied
+	// event, never skipping data. It aliases the parsed event's backing bytes (like
+	// ID and Full) and is empty when the source surfaced no token (e.g. synthetic
+	// events in tests).
+	Token []byte
 
 	// capturedAt is the wall-clock time the reader buffered the event. It is used
 	// only for lag estimation and is never serialized.
@@ -117,14 +132,26 @@ type Tailer struct {
 	allowed        []namespace.Namespace
 	applyBatchSize int
 	source         eventSource
-	applier        applier
-	buffer         chan ChangeEvent
+	// sourceFactory builds the event source; nil selects the real driver adapter
+	// (openChangeStream). Tests inject a factory to observe the resolved options
+	// (e.g. that TailOptions.Resume is passed through) and return a scripted source.
+	sourceFactory func(ctx context.Context, src *mongox.Client, opts engine.TailOptions) (eventSource, error)
+	applier       applier
+	buffer        chan ChangeEvent
 
 	streamCtx    context.Context
 	streamCancel context.CancelFunc
 	stopOnce     sync.Once
 	readerDone   chan struct{}
 	opened       bool
+
+	// Applied-token checkpointing. onToken and now are set in Open and only read
+	// thereafter; appliedToken and lastTokenEmitAt are touched solely by the apply
+	// goroutine (applyBatch and Apply's deferred flush), so they need no locking.
+	onToken         func(engine.ResumeToken)
+	now             func() time.Time
+	appliedToken    []byte
+	lastTokenEmitAt time.Time
 
 	// mu guards all mutable shared state below.
 	mu              sync.Mutex
@@ -150,7 +177,7 @@ func New(src, dst *mongox.Client, reporter engine.Reporter, log *slog.Logger) *T
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Tailer{src: src, dst: dst, reporter: reporter, log: log}
+	return &Tailer{src: src, dst: dst, reporter: reporter, log: log, now: time.Now}
 }
 
 // Open opens the change stream and starts the background reader goroutine that
@@ -175,6 +202,13 @@ func (t *Tailer) Open(ctx context.Context, opts engine.TailOptions) error {
 	t.readerDone = make(chan struct{})
 	t.streamCtx, t.streamCancel = context.WithCancel(ctx)
 
+	// The applied-token checkpoint callback and clock are read only by the apply
+	// goroutine, which starts strictly after Open returns.
+	t.onToken = opts.OnToken
+	if t.now == nil {
+		t.now = time.Now
+	}
+
 	// Seed the resume token so Token() returns the caller-provided token before
 	// the first event advances it.
 	if !opts.Resume.IsZero() {
@@ -187,9 +221,16 @@ func (t *Tailer) Open(ctx context.Context, opts engine.TailOptions) error {
 		t.applier = newBulkApplier(t.dst)
 	}
 	if t.source == nil {
-		src, err := openChangeStream(ctx, t.src, opts)
+		factory := t.sourceFactory
+		if factory == nil {
+			factory = openChangeStream
+		}
+		src, err := factory(ctx, t.src, opts)
 		if err != nil {
 			t.streamCancel()
+			if isChangeStreamHistoryLost(err) {
+				return fmt.Errorf("cdc: open change stream: %w: %w", ErrChangeStreamHistoryLost, err)
+			}
 			return fmt.Errorf("cdc: open change stream: %w", err)
 		}
 		t.source = src
@@ -216,6 +257,12 @@ func (t *Tailer) readLoop() {
 		if err != nil {
 			if t.streamCtx.Err() != nil {
 				return // graceful: Stop, Close, or parent cancellation.
+			}
+			// A lost change-stream history (286) is unrecoverable: wrap the sentinel
+			// so Apply surfaces it and the orchestrator can mark the run non-resumable.
+			if isChangeStreamHistoryLost(err) {
+				t.setReadErr(fmt.Errorf("cdc: change stream read: %w: %w", ErrChangeStreamHistoryLost, err))
+				return
 			}
 			t.setReadErr(fmt.Errorf("cdc: change stream read: %w", err))
 			return
@@ -268,6 +315,9 @@ func (t *Tailer) Apply(ctx context.Context) error {
 		return errors.New("cdc: Apply called before Open")
 	}
 	t.reporter.Phase(engine.PhaseApply)
+	// Always checkpoint the final applied position when Apply stops (drain, error,
+	// or cancellation), even if the throttle suppressed its last periodic emit.
+	defer t.flushToken()
 
 	for {
 		batch, closed, err := t.nextBatch(ctx)
@@ -361,6 +411,12 @@ func (t *Tailer) applyBatch(ctx context.Context, batch []ChangeEvent) error {
 	}
 	t.oldestPendingAt = time.Time{}
 	t.mu.Unlock()
+
+	// Checkpoint the APPLIED resume position: the token of the newest event in this
+	// batch. Every earlier event was applied (data) or handled (DDL/invalidate)
+	// above, and this runs after the destination write succeeds, so the token never
+	// runs ahead of applied data — a resume from it re-reads only unapplied events.
+	t.recordAppliedToken(lastToken(batch))
 
 	if invalidate {
 		t.Stop()
@@ -474,6 +530,55 @@ func (t *Tailer) Close(ctx context.Context) error {
 		defer cancel()
 		if err := t.source.Close(closeCtx); err != nil {
 			return fmt.Errorf("cdc: close change stream: %w", err)
+		}
+	}
+	return nil
+}
+
+// recordAppliedToken remembers tok as the newest durably-applied resume token and
+// emits it through OnToken, throttled to at most once per second. It is a no-op for
+// an empty token. Called only from the apply goroutine.
+func (t *Tailer) recordAppliedToken(tok []byte) {
+	if len(tok) == 0 {
+		return
+	}
+	t.appliedToken = tok
+	t.emitAppliedToken(tok, false)
+}
+
+// emitAppliedToken invokes OnToken with a caller-owned copy of tok. Unless force is
+// set it is throttled to at most one call per second (wall clock) to avoid
+// checkpoint spam. A nil OnToken or empty token is a no-op. Called only from the
+// apply goroutine.
+func (t *Tailer) emitAppliedToken(tok []byte, force bool) {
+	if t.onToken == nil || len(tok) == 0 {
+		return
+	}
+	now := time.Now
+	if t.now != nil {
+		now = t.now
+	}
+	ts := now()
+	if !force && !t.lastTokenEmitAt.IsZero() && ts.Sub(t.lastTokenEmitAt) < time.Second {
+		return
+	}
+	t.lastTokenEmitAt = ts
+	t.onToken(engine.ResumeToken(cloneBytes(tok)))
+}
+
+// flushToken force-emits the most recently applied resume token, bypassing the
+// throttle, so Apply always checkpoints its final applied position when it stops.
+func (t *Tailer) flushToken() {
+	t.emitAppliedToken(t.appliedToken, true)
+}
+
+// lastToken returns the resume token of the last event in the batch that carries
+// one, or nil if none do. Change events arrive in oplog order, so the last token in
+// an applied batch is the furthest-along position that batch reached.
+func lastToken(batch []ChangeEvent) []byte {
+	for i := len(batch) - 1; i >= 0; i-- {
+		if len(batch[i].Token) > 0 {
+			return batch[i].Token
 		}
 	}
 	return nil
