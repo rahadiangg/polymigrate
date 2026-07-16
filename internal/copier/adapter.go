@@ -11,6 +11,7 @@ import (
 
 	"github.com/weefer/mongomigrate/internal/mongox"
 	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/weefer/mongomigrate/internal/retry"
 )
 
 // dupKeyCode is the MongoDB duplicate-key error code.
@@ -133,7 +134,14 @@ func (d *realDstColl) writeBatch(ctx context.Context, docs []bson.Raw) (inserted
 	for i := range docs {
 		payload[i] = docs[i]
 	}
-	_, werr := d.coll.InsertMany(ctx, payload, options.InsertMany().SetOrdered(false))
+	// Retry transient failures (network blips, primary step-downs). A retry after
+	// a partial insert re-issues the same unordered batch; already-inserted docs
+	// surface as duplicate-key write errors, which are tolerated below, so the net
+	// effect is still "every doc inserted exactly once".
+	werr := retry.Do(ctx, retry.DefaultPolicy(), retry.MongoClassifier, func() error {
+		_, e := d.coll.InsertMany(ctx, payload, options.InsertMany().SetOrdered(false))
+		return e
+	})
 	if werr == nil {
 		return len(docs), 0, 0, nil
 	}
@@ -187,7 +195,12 @@ func (d *realDstColl) writeBatchUpsert(ctx context.Context, docs []bson.Raw) (wr
 		return 0, failed, nil
 	}
 
-	_, werr := d.coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	// Retry transient failures; ReplaceOne(upsert) is idempotent so re-issuing the
+	// batch is always safe.
+	werr := retry.Do(ctx, retry.DefaultPolicy(), retry.MongoClassifier, func() error {
+		_, e := d.coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+		return e
+	})
 	if werr == nil {
 		return len(models), failed, nil
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/weefer/mongomigrate/internal/cdc"
+	"github.com/weefer/mongomigrate/internal/checkpoint"
 	"github.com/weefer/mongomigrate/internal/config"
 	"github.com/weefer/mongomigrate/internal/copier"
 	"github.com/weefer/mongomigrate/internal/engine"
@@ -35,6 +36,10 @@ func newMigrateCmd() *cobra.Command {
 		applyBatchSize int
 		lagThreshold   time.Duration
 		autoCutover    bool
+		noCheckpoint   bool
+		resume         bool
+		runIDFlag      string
+		checkpointDir  string
 	)
 	cmd := &cobra.Command{
 		Use:   "migrate",
@@ -87,8 +92,25 @@ func newMigrateCmd() *cobra.Command {
 			vf := verify.New(eps.src, eps.dst, log)
 			eng := migrate.New(cp, tl, vf, reporter, log)
 
+			var ckStore checkpoint.Store
+			runID := ""
+			cfgHash := ""
+			if !noCheckpoint {
+				ckStore = buildCheckpointStore(eps.dst, checkpointDir)
+				runID = runIDFlag
+				if runID == "" {
+					runID = defaultRunID(cfg)
+				}
+				cfgHash = configHash(cfg)
+				log.Info("checkpointing enabled", "runId", runID, "dir", checkpointDir, "resume", resume)
+			}
+
 			opts := migrate.Options{
-				Live: live,
+				Checkpoint: ckStore,
+				RunID:      runID,
+				ConfigHash: cfgHash,
+				Resume:     resume,
+				Live:       live,
 				Copy: engine.CopyOptions{
 					Namespaces:    nss,
 					Workers:       cfg.Workers,
@@ -146,6 +168,10 @@ func newMigrateCmd() *cobra.Command {
 	fl.IntVar(&applyBatchSize, "apply-batch-size", 500, "live mode: change events per bulk apply")
 	fl.DurationVar(&lagThreshold, "lag-threshold", 2*time.Second, "live mode: cutover-ready lag threshold")
 	fl.BoolVar(&autoCutover, "auto-cutover", true, "live mode: cut over automatically when lag is low (false = wait for Enter)")
+	fl.BoolVar(&noCheckpoint, "no-checkpoint", false, "disable durable checkpointing (no resume on crash)")
+	fl.BoolVar(&resume, "resume", false, "resume a prior interrupted run from its checkpoint")
+	fl.StringVar(&runIDFlag, "run-id", "", "checkpoint run id (default: derived from src+dst+filter)")
+	fl.StringVar(&checkpointDir, "checkpoint-dir", defaultCheckpointDir, "local directory for the checkpoint file mirror")
 	return cmd
 }
 

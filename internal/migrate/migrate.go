@@ -25,7 +25,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/weefer/mongomigrate/internal/checkpoint"
 	"github.com/weefer/mongomigrate/internal/engine"
+	"github.com/weefer/mongomigrate/internal/namespace"
 )
 
 // defaultPollInterval is the lag-poll cadence used when Options.PollInterval is
@@ -68,6 +70,22 @@ type Options struct {
 	Proceed <-chan struct{}
 	// PollInterval is the lag-poll cadence; defaults to 1s when zero.
 	PollInterval time.Duration
+
+	// --- Resilience / resume (optional) ---
+
+	// Checkpoint, when non-nil, persists progress so the run can resume after a
+	// crash. Copy progress and the applied CDC token are checkpointed as they
+	// advance, and a final checkpoint is flushed even on a cancelled run.
+	Checkpoint checkpoint.Store
+	// RunID identifies this migration for the checkpoint store.
+	RunID string
+	// ConfigHash guards a resume against a changed configuration; a resumed run
+	// whose stored ConfigHash differs is rejected.
+	ConfigHash string
+	// Resume, when true, loads an existing checkpoint for RunID and continues:
+	// completed collections are skipped, an in-progress one resumes from its last
+	// _id, and (live) the change stream resumes from the saved token.
+	Resume bool
 }
 
 // Report is the aggregate outcome of a Run. It carries the last snapshot
@@ -81,12 +99,16 @@ type Report struct {
 }
 
 // Engine orchestrates a migration across the copier, tailer, and verifier.
+// An Engine runs one migration at a time (Run is not safe for concurrent use on
+// the same Engine); cp holds the current run's checkpointer, if any.
 type Engine struct {
 	copier   engine.Copier
 	tailer   engine.Tailer
 	verifier engine.Verifier
 	reporter engine.Reporter
 	log      *slog.Logger
+
+	cp *checkpointer // set for the duration of a checkpointed Run
 }
 
 // New builds an Engine from its components. A nil reporter is replaced with a
@@ -123,6 +145,19 @@ func (e *Engine) Run(ctx context.Context, opts Options) (Report, error) {
 		return rep, errors.New("migrate: RunVerify set but verifier is nil")
 	}
 
+	// Set up checkpointing / resume before any data moves.
+	if opts.Checkpoint != nil {
+		if err := e.setupCheckpoint(ctx, &opts); err != nil {
+			e.recordPhase(&rep, engine.PhaseFailed)
+			return rep, err
+		}
+		// Guarantee a durable final checkpoint even if the run context is cancelled.
+		defer func() {
+			e.cp.Flush(context.WithoutCancel(ctx))
+			e.cp = nil
+		}()
+	}
+
 	if opts.Live {
 		if e.tailer == nil {
 			e.recordPhase(&rep, engine.PhaseFailed)
@@ -133,10 +168,104 @@ func (e *Engine) Run(ctx context.Context, opts Options) (Report, error) {
 	return e.runSnapshot(ctx, opts, rep)
 }
 
-// recordPhase appends p to the report's phase list and notifies the reporter.
+// recordPhase appends p to the report's phase list, notifies the reporter, and
+// (when checkpointing) records the phase durably.
 func (e *Engine) recordPhase(rep *Report, p engine.Phase) {
 	rep.Phases = append(rep.Phases, p)
 	e.reporter.Phase(p)
+	if e.cp != nil {
+		e.cp.recordPhase(p)
+	}
+}
+
+// setupCheckpoint loads any existing checkpoint (when resuming), rewrites opts to
+// skip completed collections / resume in-progress ones / resume the change
+// stream, installs the checkpointer, and wires the copier/tailer progress
+// callbacks to it.
+func (e *Engine) setupCheckpoint(ctx context.Context, opts *Options) error {
+	mode := "snapshot"
+	if opts.Live {
+		mode = "live"
+	}
+	state := checkpoint.State{
+		RunID:      opts.RunID,
+		Mode:       mode,
+		ConfigHash: opts.ConfigHash,
+		Namespaces: map[string]checkpoint.NSProgress{},
+	}
+
+	if opts.Resume {
+		prev, found, err := opts.Checkpoint.Load(ctx, opts.RunID)
+		if err != nil {
+			return fmt.Errorf("load checkpoint %q: %w", opts.RunID, err)
+		}
+		if found {
+			if prev.ConfigHash != "" && opts.ConfigHash != "" && prev.ConfigHash != opts.ConfigHash {
+				return fmt.Errorf("cannot resume run %q: configuration changed since the checkpoint was written", opts.RunID)
+			}
+			if prev.NonResumable {
+				return fmt.Errorf("cannot resume run %q: %w (start a fresh migration)", opts.RunID, engine.ErrChangeStreamHistoryLost)
+			}
+			applyResume(opts, prev)
+			state = prev
+			if state.Namespaces == nil {
+				state.Namespaces = map[string]checkpoint.NSProgress{}
+			}
+			e.reporter.Event("resuming from checkpoint", "runId", opts.RunID,
+				"completed", countDone(prev), "token", len(prev.ResumeToken) > 0)
+		}
+	}
+
+	e.cp = newCheckpointer(ctx, opts.Checkpoint, state, e.log)
+	// Wire the copier/tailer callbacks to the checkpointer, preserving any caller
+	// callback by chaining.
+	callerProgress := opts.Copy.OnProgress
+	opts.Copy.OnProgress = func(ns namespace.Namespace, lastID []byte, docsCopied int64, done bool) {
+		e.cp.recordProgress(ns, lastID, docsCopied, done)
+		if callerProgress != nil {
+			callerProgress(ns, lastID, docsCopied, done)
+		}
+	}
+	callerToken := opts.Tail.OnToken
+	opts.Tail.OnToken = func(tok engine.ResumeToken) {
+		e.cp.recordToken(tok)
+		if callerToken != nil {
+			callerToken(tok)
+		}
+	}
+	return nil
+}
+
+// applyResume rewrites opts from a loaded checkpoint: completed namespaces are
+// skipped, in-progress ones resume from their last _id, and the change stream
+// resumes from the saved token.
+func applyResume(opts *Options, prev checkpoint.State) {
+	if opts.Copy.SkipNamespaces == nil {
+		opts.Copy.SkipNamespaces = map[string]bool{}
+	}
+	if opts.Copy.ResumeFrom == nil {
+		opts.Copy.ResumeFrom = map[string][]byte{}
+	}
+	for ns, p := range prev.Namespaces {
+		if p.Done {
+			opts.Copy.SkipNamespaces[ns] = true
+		} else if len(p.LastID) > 0 {
+			opts.Copy.ResumeFrom[ns] = p.LastID
+		}
+	}
+	if opts.Live && len(prev.ResumeToken) > 0 {
+		opts.Tail.Resume = engine.ResumeToken(prev.ResumeToken)
+	}
+}
+
+func countDone(s checkpoint.State) int {
+	n := 0
+	for _, p := range s.Namespaces {
+		if p.Done {
+			n++
+		}
+	}
+	return n
 }
 
 // runSnapshot performs the snapshot-only flow:
@@ -285,6 +414,7 @@ func (e *Engine) runLive(ctx context.Context, opts Options, rep Report) (out Rep
 	// Stop the tailer and join the Apply goroutine.
 	e.tailer.Stop()
 	if aerr := ah.join(); aerr != nil {
+		e.markIfHistoryLost(aerr)
 		e.recordPhase(&rep, engine.PhaseFailed)
 		return rep, fmt.Errorf("apply: %w", aerr)
 	}
@@ -378,11 +508,21 @@ func (e *Engine) abort(ah *applyHandle, rep *Report, cause error) error {
 		ah.cancel()
 	}
 	ah.join()
+	e.markIfHistoryLost(cause)
 	if isCancel(cause) {
 		return cause
 	}
 	e.recordPhase(rep, engine.PhaseFailed)
 	return cause
+}
+
+// markIfHistoryLost flags the checkpoint non-resumable when err is a lost
+// change-stream history, so a subsequent --resume fails fast instead of silently
+// starting a change stream that would miss data.
+func (e *Engine) markIfHistoryLost(err error) {
+	if e.cp != nil && errors.Is(err, engine.ErrChangeStreamHistoryLost) {
+		e.cp.markNonResumable()
+	}
 }
 
 // isCancel reports whether err is a context cancellation or deadline error.

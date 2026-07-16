@@ -12,6 +12,7 @@ import (
 	"github.com/weefer/mongomigrate/internal/engine"
 	"github.com/weefer/mongomigrate/internal/mongox"
 	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/weefer/mongomigrate/internal/retry"
 )
 
 // openChangeStream opens a change stream on the source with FullDocument set to
@@ -123,7 +124,12 @@ func (a *bulkApplier) apply(ctx context.Context, batch []ChangeEvent) (int, int,
 			continue
 		}
 		coll := a.dst.Client.Database(ns.DB).Collection(ns.Collection)
-		_, err := coll.BulkWrite(ctx, g.models, options.BulkWrite().SetOrdered(false))
+		// Retry transient failures; the batch is idempotent (ReplaceOne-upsert /
+		// DeleteOne keyed by _id) so re-issuing it converges to the same state.
+		err := retry.Do(ctx, retry.DefaultPolicy(), retry.MongoClassifier, func() error {
+			_, e := coll.BulkWrite(ctx, g.models, options.BulkWrite().SetOrdered(false))
+			return e
+		})
 		if err != nil && !isOnlyDuplicateKeyErrors(err) {
 			return inserts, deletes, fmt.Errorf("cdc: bulk write %s: %w", ns, err)
 		}

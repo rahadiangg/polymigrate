@@ -9,10 +9,18 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/weefer/mongomigrate/internal/namespace"
 )
+
+// ErrChangeStreamHistoryLost signals that the source oplog no longer retains the
+// change-stream history needed to resume (server error 286). It is fatal and
+// non-resumable: the run cannot continue from its checkpoint token and a fresh
+// snapshot is required. It lives here (rather than in the cdc package) so the
+// driver-free orchestrator can detect it with errors.Is without importing cdc.
+var ErrChangeStreamHistoryLost = errors.New("change stream history lost (resume point expired from the oplog)")
 
 // -----------------------------------------------------------------------------
 // Reporter — progress + phase notifications. Implementations must be safe for

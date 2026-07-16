@@ -61,7 +61,9 @@ const codeDuplicateKey = 11000
 // It is fatal and non-resumable: the run cannot continue from its checkpoint token,
 // so the operator must start a fresh snapshot. Apply (and Open) wrap this sentinel
 // so callers can detect the condition with errors.Is and mark the run non-resumable.
-var ErrChangeStreamHistoryLost = errors.New("cdc: change stream history lost (resume point expired from the oplog)")
+// It is an alias of engine.ErrChangeStreamHistoryLost so the driver-free
+// orchestrator can detect it without importing this package.
+var ErrChangeStreamHistoryLost = engine.ErrChangeStreamHistoryLost
 
 // ChangeEvent is the in-package, driver-independent representation of a single
 // change-stream event. Keeping the tailer's logic in terms of this type (rather
