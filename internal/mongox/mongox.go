@@ -18,6 +18,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/weefer/mongomigrate/internal/namespace"
 )
@@ -96,7 +97,13 @@ func Connect(ctx context.Context, uri string, co ConnectOptions) (*Client, error
 		ApplyURI(uri).
 		SetAppName(co.AppName).
 		SetServerSelectionTimeout(co.ServerSelectionTimeout).
-		SetConnectTimeout(co.ConnectTimeout)
+		SetConnectTimeout(co.ConnectTimeout).
+		// Majority write concern makes destination writes durable before they are
+		// acknowledged, so a checkpointed resume token (or snapshot boundary) can
+		// only ever sit behind data that survived a destination failover. This is
+		// set after ApplyURI, so it intentionally overrides any weaker w= in the URI
+		// (correctness for a migration outweighs the small throughput cost).
+		SetWriteConcern(writeconcern.Majority())
 
 	mc, err := mongo.Connect(opts)
 	if err != nil {

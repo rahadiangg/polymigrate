@@ -3,10 +3,9 @@ package cli
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/spf13/cobra"
-
-	"github.com/weefer/mongomigrate/internal/checkpoint"
 )
 
 func init() {
@@ -15,27 +14,37 @@ func init() {
 
 func newStatusCmd() *cobra.Command {
 	var (
-		runID         string
-		checkpointDir string
+		runID, checkpointDir string
+		dstURI, dstFlavor    string
 	)
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show the checkpoint (resume) status of a migration run",
-		Long: "status reads the local checkpoint mirror and reports per-collection\n" +
-			"snapshot progress, the saved change-stream token, and whether the run can\n" +
-			"be resumed.",
+		Long: "status reports per-collection snapshot progress, the saved change-stream\n" +
+			"token, and whether the run can be resumed. Pass --dst to read the\n" +
+			"authoritative checkpoint co-located with the destination; otherwise the\n" +
+			"local mirror is used, which may lag.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if runID == "" {
 				return fmt.Errorf("--run-id is required (see the run id printed by `mm migrate`)")
 			}
-			store := checkpoint.NewFileStore(checkpointDir)
-			st, found, err := store.Load(cmd.Context(), runID)
+			ctx, cancel := contextWithTimeout(cmd.Context(), 20*time.Second)
+			defer cancel()
+			store, closer, warning, err := inspectStore(ctx, dstURI, dstFlavor, checkpointDir)
 			if err != nil {
 				return err
 			}
+			defer closer()
 			out := cmd.OutOrStdout()
+			if warning != "" {
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: %s\n", warning)
+			}
+			st, found, err := store.Load(ctx, runID)
+			if err != nil {
+				return err
+			}
 			if !found {
-				fmt.Fprintf(out, "no checkpoint found for run %q in %s\n", runID, checkpointDir)
+				fmt.Fprintf(out, "no checkpoint found for run %q\n", runID)
 				return nil
 			}
 			fmt.Fprintf(out, "run:        %s\n", st.RunID)
@@ -63,27 +72,39 @@ func newStatusCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&runID, "run-id", "", "checkpoint run id (required)")
 	cmd.Flags().StringVar(&checkpointDir, "checkpoint-dir", defaultCheckpointDir, "local checkpoint directory")
+	cmd.Flags().StringVar(&dstURI, "dst", "", "destination URI, to read the authoritative checkpoint")
+	cmd.Flags().StringVar(&dstFlavor, "dst-flavor", "", "override detected destination flavor")
 	return cmd
 }
 
 func newCheckpointCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "checkpoint",
-		Short: "Manage migration checkpoints",
-	}
+	cmd := &cobra.Command{Use: "checkpoint", Short: "Manage migration checkpoints"}
 	var (
-		runID         string
-		checkpointDir string
+		runID, checkpointDir string
+		dstURI, dstFlavor    string
 	)
 	clear := &cobra.Command{
 		Use:   "clear",
-		Short: "Delete a run's local checkpoint (forces a fresh migration next time)",
+		Short: "Delete a run's checkpoint (forces a fresh migration next time)",
+		Long: "clear removes the checkpoint so the next migration starts fresh. Pass --dst\n" +
+			"to also delete the authoritative checkpoint stored on the destination;\n" +
+			"without it, only the local mirror is removed and a --resume could still\n" +
+			"resume from the destination's copy.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if runID == "" {
 				return fmt.Errorf("--run-id is required")
 			}
-			store := checkpoint.NewFileStore(checkpointDir)
-			if err := store.Delete(cmd.Context(), runID); err != nil {
+			ctx, cancel := contextWithTimeout(cmd.Context(), 20*time.Second)
+			defer cancel()
+			store, closer, warning, err := inspectStore(ctx, dstURI, dstFlavor, checkpointDir)
+			if err != nil {
+				return err
+			}
+			defer closer()
+			if warning != "" {
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: %s\n", warning)
+			}
+			if err := store.Delete(ctx, runID); err != nil {
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "cleared checkpoint %q\n", runID)
@@ -92,6 +113,8 @@ func newCheckpointCmd() *cobra.Command {
 	}
 	clear.Flags().StringVar(&runID, "run-id", "", "checkpoint run id (required)")
 	clear.Flags().StringVar(&checkpointDir, "checkpoint-dir", defaultCheckpointDir, "local checkpoint directory")
+	clear.Flags().StringVar(&dstURI, "dst", "", "destination URI, to also clear the authoritative checkpoint")
+	clear.Flags().StringVar(&dstFlavor, "dst-flavor", "", "override detected destination flavor")
 	cmd.AddCommand(clear)
 	return cmd
 }

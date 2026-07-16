@@ -3,6 +3,7 @@ package retry
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
@@ -42,15 +43,21 @@ func MongoClassifier(err error) Class {
 		return Retryable
 	}
 
-	// Server command errors: inspect retryable labels first, then the known
-	// not-primary / step-down / shutdown codes.
-	var ce mongo.CommandError
-	if errors.As(err, &ce) {
-		if ce.HasErrorLabel("RetryableWriteError") || ce.HasErrorLabel("TransientTransactionError") {
+	// Server errors: this covers BOTH a plain CommandError AND a
+	// BulkWriteException / WriteException (the types the wrapped bulk writes
+	// actually return), all of which implement mongo.ServerError. Inspect the
+	// retryable labels first, then the known not-primary / step-down / shutdown
+	// codes. Without the BulkWriteException coverage a transient step-down during a
+	// bulk write would never be retried.
+	var se mongo.ServerError
+	if errors.As(err, &se) {
+		if se.HasErrorLabel("RetryableWriteError") || se.HasErrorLabel("TransientTransactionError") {
 			return Retryable
 		}
-		if isRetryableCode(int(ce.Code)) {
-			return Retryable
+		for _, code := range retryableCodes {
+			if se.HasErrorCode(code) {
+				return Retryable
+			}
 		}
 		// Recognised-fatal codes — auth (13, 18), invalid namespace (73),
 		// ChangeStreamHistoryLost (286) — and every unrecognised code fall
@@ -67,22 +74,28 @@ func MongoClassifier(err error) Class {
 // the low-level socket/host codes and the write-concern timeout. These are safe
 // to retry because the operations we wrap (idempotent upserts/deletes keyed by
 // _id, index creation and connect) can be re-issued without corrupting data.
+// retryableCodes are the MongoDB server error codes denoting a transient
+// condition worth retrying — chiefly the "not primary" / step-down / shutdown
+// family raised while a replica set elects a new primary, plus the low-level
+// socket/host codes and the write-concern timeout. Safe to retry because every
+// operation we wrap (idempotent upserts/deletes keyed by _id, index creation,
+// connect) can be re-issued without corrupting data.
+var retryableCodes = []int{
+	10107, // NotWritablePrimary: wrote to a node that is no longer primary
+	13435, // NotPrimaryNoSecondaryOk: read/write rejected by a secondary
+	11600, // InterruptedAtShutdown: node is shutting down
+	11602, // InterruptedDueToReplStateChange: replset state changed mid-op
+	13436, // NotPrimaryOrSecondary: node not in a serving state (recovering)
+	189,   // PrimarySteppedDown: primary stepped down during the operation
+	91,    // ShutdownInProgress: server is shutting down
+	9001,  // SocketException: low-level socket failure
+	7,     // HostNotFound: could not resolve/reach a replset member
+	6,     // HostUnreachable: transient connectivity loss to a member
+	89,    // NetworkTimeout: network operation timed out
+	64,    // WriteConcernFailed: write concern not satisfied (e.g. w timeout)
+}
+
+// isRetryableCode reports whether a MongoDB server error code is in retryableCodes.
 func isRetryableCode(code int) bool {
-	switch code {
-	case 10107, // NotWritablePrimary: wrote to a node that is no longer primary
-		13435, // NotPrimaryNoSecondaryOk: read/write rejected by a secondary
-		11600, // InterruptedAtShutdown: node is shutting down
-		11602, // InterruptedDueToReplStateChange: replset state changed mid-op
-		13436, // NotPrimaryOrSecondary: node not in a serving state (recovering)
-		189,   // PrimarySteppedDown: primary stepped down during the operation
-		91,    // ShutdownInProgress: server is shutting down
-		9001,  // SocketException: low-level socket failure
-		7,     // HostNotFound: could not resolve/reach a replset member
-		6,     // HostUnreachable: transient connectivity loss to a member
-		89,    // NetworkTimeout: network operation timed out
-		64:    // WriteConcernFailed: write concern not satisfied (e.g. w timeout)
-		return true
-	default:
-		return false
-	}
+	return slices.Contains(retryableCodes, code)
 }

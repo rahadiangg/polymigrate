@@ -122,10 +122,12 @@ type CopyResult struct {
 	Duration    time.Duration
 }
 
-// Failed reports whether any collection failed.
+// Failed reports whether any collection failed — either a fatal error or any
+// unrecovered per-document failures (which leave holes that must not be reported
+// as a successful copy).
 func (r CopyResult) Failed() bool {
 	for _, c := range r.Collections {
-		if c.Err != "" {
+		if c.Err != "" || c.DocsFailed > 0 {
 			return true
 		}
 	}

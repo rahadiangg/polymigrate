@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -49,4 +51,23 @@ func configHash(cfg config.Config) string {
 // so a bare re-run of the same migration finds its checkpoint.
 func defaultRunID(cfg config.Config) string {
 	return "mm-" + configHash(cfg)[:12]
+}
+
+// inspectStore builds the store used by `status` and `checkpoint clear`. When a
+// destination URI is supplied it returns the same Composite that `migrate` uses
+// (authoritative destination MongoStore + local file mirror), so status reflects
+// — and clear removes — the authoritative checkpoint. Without a destination it
+// falls back to the local mirror alone and returns a warning to surface that the
+// mirror may lag, and that clear will NOT remove the destination's copy.
+func inspectStore(ctx context.Context, dstURI, dstFlavor, dir string) (store checkpoint.Store, closer func(), warning string, err error) {
+	file := checkpoint.NewFileStore(dir)
+	if dstURI == "" {
+		return file, func() {}, "using the local checkpoint mirror only; pass --dst to read/clear the authoritative destination checkpoint", nil
+	}
+	c, err := mongox.Connect(ctx, dstURI, mongox.ConnectOptions{FlavorOverride: mongox.Flavor(dstFlavor)})
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("connect destination: %w", err)
+	}
+	store = checkpoint.NewComposite(checkpoint.NewMongoStore(c, "", ""), file)
+	return store, func() { _ = c.Close(context.Background()) }, "", nil
 }

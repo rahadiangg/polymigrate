@@ -203,20 +203,31 @@ func (c *Copier) copyCollection(ctx context.Context, ns namespace.Namespace, opt
 		return finish()
 	}
 
+	dst := c.factory.dstColl(ns)
+
 	// Resume fast-path: a namespace recorded as fully copied on a prior run is
-	// skipped entirely. It is marked Skipped so callers can tell it apart from a
-	// freshly-copied collection; OnProgress is not re-invoked (it already fired
-	// with done=true on the run that completed it).
+	// skipped entirely — BUT only if the destination collection actually still
+	// holds data. This guards against a stale checkpoint (e.g. a local file mirror
+	// that outlived a rebuilt, now-empty destination): trusting "already complete"
+	// against an empty destination would leave it empty forever. When the
+	// destination is empty we re-copy instead of skipping.
 	if opts.SkipNamespaces[ns.String()] {
-		res.Skipped = true
-		c.reporter.Event("collection skipped (resumed: already complete)", "ns", ns.String())
-		return finish()
+		n, err := dst.count(ctx)
+		if err != nil {
+			res.Err = fmt.Errorf("count destination %s: %w", ns, err).Error()
+			return finish()
+		}
+		if n > 0 {
+			res.Skipped = true
+			c.reporter.Event("collection skipped (resumed: already complete)", "ns", ns.String())
+			return finish()
+		}
+		c.reporter.Event("checkpoint marks collection complete but destination is empty; re-copying", "ns", ns.String())
 	}
 
 	c.reporter.Event("collection started", "ns", ns.String())
 
 	src := c.factory.srcColl(ns)
-	dst := c.factory.dstColl(ns)
 
 	// Prepare the destination: drop, or skip a non-empty target.
 	if opts.DropTarget {
@@ -296,6 +307,13 @@ func (c *Copier) copyData(ctx context.Context, ns namespace.Namespace, src srcCo
 	// lastID is the resume boundary: the raw BSON of the greatest _id copied so
 	// far. It only advances past cleanly-written batches.
 	var lastID []byte
+	// boundaryPoisoned is set the moment any batch leaves a per-document failure
+	// (a "hole"). Because documents are copied in _id order and the boundary is a
+	// single scalar, a later clean batch would otherwise push lastID PAST the hole
+	// and a resume ({_id:{$gt:lastID}}) would silently skip the failed document.
+	// Once poisoned, the boundary is frozen at the last hole-free _id so a resume
+	// re-reads (and idempotently upserts) the failed range.
+	boundaryPoisoned := false
 
 	flush := func() error {
 		if len(batch) == 0 {
@@ -324,9 +342,15 @@ func (c *Copier) copyData(ctx context.Context, ns namespace.Namespace, src srcCo
 			res.Err = fmt.Errorf("write batch %s: %w", ns, werr).Error()
 			return werr
 		}
-		// Only advance the checkpoint boundary when the whole batch was written
-		// cleanly; otherwise a resume could skip a document that failed here.
-		if failed == 0 {
+		// Freeze the boundary permanently once any batch leaves a hole, so a later
+		// clean batch cannot advance the resume point past a failed document.
+		if failed > 0 {
+			boundaryPoisoned = true
+		}
+		// Only advance the checkpoint boundary when this batch AND every prior batch
+		// in this collection were written cleanly; otherwise a resume could skip a
+		// document that failed earlier.
+		if failed == 0 && !boundaryPoisoned {
 			if id, iderr := extractID(last); iderr == nil {
 				lastID = id
 			} else {
@@ -365,10 +389,16 @@ func (c *Copier) copyData(ctx context.Context, ns namespace.Namespace, src srcCo
 	if err := flush(); err != nil {
 		return err
 	}
-	// Signal the namespace's data copy is complete so the orchestrator can mark
-	// it done in the checkpoint.
+	// A collection with unrecovered per-document failures is NOT complete: mark it
+	// failed (so the run reports failure and does not claim success) and signal
+	// done=false so the orchestrator leaves it resumable — a later run re-copies
+	// the frozen, not-yet-advanced range via the idempotent upsert path.
+	done := res.DocsFailed == 0
+	if !done {
+		res.Err = fmt.Sprintf("%d document(s) failed to copy in %s; run is resumable and will retry them", res.DocsFailed, ns.String())
+	}
 	if opts.OnProgress != nil {
-		opts.OnProgress(ns, lastID, res.DocsCopied, true)
+		opts.OnProgress(ns, lastID, res.DocsCopied, done)
 	}
 	return nil
 }

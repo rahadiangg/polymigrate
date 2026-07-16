@@ -754,9 +754,16 @@ func TestCopy_OtherWriteErrorsCountFailedButContinue(t *testing.T) {
 	if got := len(dst.allBatches()); got != 3 {
 		t.Errorf("attempted %d batches, want 3", got)
 	}
-	// Non-fatal in-batch failures are not a per-collection Err.
-	if res.Collections[0].Err != "" {
-		t.Errorf("unexpected Err: %q", res.Collections[0].Err)
+	// Per-document failures do not abort the collection, but they DO mark it
+	// failed so the run cannot report success and the collection stays resumable.
+	if res.Collections[0].Err == "" {
+		t.Error("expected a per-collection Err summarizing the failed documents")
+	}
+	if res.Collections[0].DocsFailed != 3 {
+		t.Errorf("DocsFailed=%d, want 3", res.Collections[0].DocsFailed)
+	}
+	if !res.Failed() {
+		t.Error("CopyResult.Failed() should be true when documents failed")
 	}
 }
 
@@ -1219,7 +1226,9 @@ func TestCopy_SkipNamespacesSkipsEntirely(t *testing.T) {
 	f := newFakeFactory()
 	n1 := ns("shop", "orders")
 	src := &fakeSrcColl{docs: makeDocs(t, 5), decodeErr: -1}
-	dst := &fakeDstColl{}
+	// A non-empty destination represents an intact target: the "already complete"
+	// checkpoint is trustworthy, so the collection is skipped.
+	dst := &fakeDstColl{countVal: 5}
 	f.add(n1, src, dst)
 
 	rec := &progressRec{}
@@ -1254,6 +1263,85 @@ func TestCopy_SkipNamespacesSkipsEntirely(t *testing.T) {
 	}
 	if calls := rec.snapshot(); len(calls) != 0 {
 		t.Errorf("OnProgress must not be called for a skipped namespace, got %d calls", len(calls))
+	}
+}
+
+// TestCopy_SkipNamespacesReCopiesWhenDestinationEmpty verifies the guard against a
+// stale checkpoint outliving a rebuilt (empty) destination: a namespace marked
+// complete is re-copied — not skipped — when the destination collection is empty.
+func TestCopy_SkipNamespacesReCopiesWhenDestinationEmpty(t *testing.T) {
+	f := newFakeFactory()
+	n1 := ns("shop", "orders")
+	src := &fakeSrcColl{docs: makeDocs(t, 5), decodeErr: -1}
+	dst := &fakeDstColl{countVal: 0} // rebuilt / empty destination
+	f.add(n1, src, dst)
+
+	c := newWithFactory(f, engine.NopReporter{}, nil)
+	res, err := c.Copy(context.Background(), engine.CopyOptions{
+		Namespaces:     []namespace.Namespace{n1},
+		Workers:        1,
+		BatchSize:      2,
+		SkipNamespaces: map[string]bool{n1.String(): true},
+	})
+	if err != nil {
+		t.Fatalf("Copy error: %v", err)
+	}
+	if res.Collections[0].Skipped {
+		t.Error("must NOT skip a complete namespace when the destination is empty")
+	}
+	if res.TotalDocs != 5 {
+		t.Errorf("expected all 5 docs re-copied, got %d", res.TotalDocs)
+	}
+}
+
+// TestCopy_BoundaryFreezesAfterFailure is the regression test for the critical
+// resume-boundary bug: once an earlier batch leaves a hole (a per-document
+// failure), a later CLEAN batch must NOT advance the checkpoint boundary past the
+// hole — otherwise a resume ({_id:{$gt:boundary}}) would skip the failed document.
+func TestCopy_BoundaryFreezesAfterFailure(t *testing.T) {
+	f := newFakeFactory()
+	n1 := ns("db", "c")
+	src := &fakeSrcColl{docs: makeDocs(t, 6), decodeErr: -1} // _ids 0..5
+	// Batches of 2: [0,1], [2,3], [4,5]. Fail the SECOND batch only.
+	var call int
+	dst := &fakeDstColl{writeFn: func(docs []bson.Raw) (int, int, int, error) {
+		call++
+		if call == 2 {
+			return len(docs) - 1, 0, 1, nil // one doc fails, no fatal error
+		}
+		return len(docs), 0, 0, nil
+	}}
+	f.add(n1, src, dst)
+
+	rec := &progressRec{}
+	res, err := newWithFactory(f, engine.NopReporter{}, nil).Copy(context.Background(), engine.CopyOptions{
+		Namespaces: []namespace.Namespace{n1},
+		Workers:    1,
+		BatchSize:  2,
+		OnProgress: rec.fn,
+	})
+	if err != nil {
+		t.Fatalf("Copy error: %v", err)
+	}
+	// The collection had a failure: not complete, marked failed, boundary frozen.
+	calls := rec.snapshot()
+	if len(calls) == 0 {
+		t.Fatal("expected OnProgress calls")
+	}
+	final := calls[len(calls)-1]
+	if final.done {
+		t.Error("collection with a failed document must not signal done=true")
+	}
+	// The frozen boundary must be the last hole-free _id (1), never 3 or 5.
+	got, ok := idFromBytes(final.lastID)
+	if !ok {
+		t.Fatalf("could not decode boundary lastID")
+	}
+	if got != 1 {
+		t.Errorf("resume boundary = _id %d, want 1 (frozen before the hole); a value >1 would skip the failed doc on resume", got)
+	}
+	if res.Collections[0].DocsFailed != 1 {
+		t.Errorf("DocsFailed=%d, want 1", res.Collections[0].DocsFailed)
 	}
 }
 
