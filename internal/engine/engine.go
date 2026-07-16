@@ -76,6 +76,22 @@ type CopyOptions struct {
 	CopyIndexes bool
 	// SkipExistingNonEmpty skips a destination collection that already holds docs.
 	SkipExistingNonEmpty bool
+
+	// --- Resilience / resume (all optional; zero values = fresh, non-resumable copy) ---
+
+	// SkipNamespaces lists namespaces (by ns.String()) already fully copied on a
+	// prior run; the copier skips them entirely when resuming.
+	SkipNamespaces map[string]bool
+	// ResumeFrom maps a namespace (ns.String()) to the raw BSON of the last _id
+	// already copied. The copier resumes that namespace at {_id: {$gt: lastID}}
+	// (documents are copied sorted by _id) and uses idempotent upserts so the
+	// boundary batch can be safely re-copied.
+	ResumeFrom map[string][]byte
+	// OnProgress, if non-nil, is invoked during and at the end of each collection
+	// copy with the last _id copied so far (raw BSON) and the running doc count, so
+	// the orchestrator can persist a checkpoint. It is called from worker
+	// goroutines and MUST be safe for concurrent use.
+	OnProgress func(ns namespace.Namespace, lastID []byte, docsCopied int64, done bool)
 }
 
 // CollectionCopyResult is the per-collection outcome of a snapshot copy.
@@ -135,6 +151,13 @@ type TailOptions struct {
 	BufferSize int
 	// ApplyBatchSize is the max number of change events applied per bulk write.
 	ApplyBatchSize int
+
+	// OnToken, if non-nil, is invoked (throttled by the tailer) with the resume
+	// token of the LAST APPLIED event — never a token that has only been captured
+	// but not yet applied. This ordering is critical: checkpointing a token ahead
+	// of applied data would cause a resumed stream to skip unapplied events and
+	// lose data. Called from the apply goroutine; must be safe for concurrent use.
+	OnToken func(token ResumeToken)
 }
 
 // TailStats is a snapshot of tailer progress. It must be safe to read while the
