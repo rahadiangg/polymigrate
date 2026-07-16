@@ -31,20 +31,39 @@ type IndexDescriptor struct {
 	// "" when the index has no partial filter.
 	PartialFilter string
 	// CollationLocale is the collation locale, or "" when the index uses the
-	// simple (binary) collation.
+	// simple (binary) collation. Kept for human-readable reporting.
 	CollationLocale string
+	// Collation is a canonical hex hash of the FULL collation document with the
+	// server-assigned "version" field removed, so collation strength/caseLevel/
+	// etc. participate in equivalence but a version difference across a server
+	// upgrade does not cause a false mismatch.
+	Collation string
+	// Weights is a canonical hash of a text index's field weights, or "".
+	Weights string
+	// DefaultLanguage / LanguageOverride are text-index options.
+	DefaultLanguage  string
+	LanguageOverride string
+	// WildcardProjection is a canonical hash of a wildcard index's projection, or "".
+	WildcardProjection string
+	// Hidden reports the hidden option (an index invisible to the planner).
+	Hidden bool
+	// Geo holds the 2d/2dsphere bits/min/max options, "" when unset.
+	Geo string
 }
 
 // Signature returns the name-independent equivalence key for the index. Indexes
-// with equal signatures are treated as the same index during diffing.
+// with equal signatures are treated as the same index during diffing. Every
+// option the copier can differ on participates, so a genuinely different
+// destination index cannot pass as a match.
 func (d IndexDescriptor) Signature() string {
 	ttl := "none"
 	if d.HasExpire {
 		ttl = strconv.FormatInt(d.ExpireAfterSeconds, 10)
 	}
 	return fmt.Sprintf(
-		"key=%s|unique=%t|sparse=%t|ttl=%s|partial=%s|collation=%s",
-		d.Key, d.Unique, d.Sparse, ttl, d.PartialFilter, d.CollationLocale,
+		"key=%s|unique=%t|sparse=%t|ttl=%s|partial=%s|collation=%s|weights=%s|deflang=%s|langover=%s|wildcard=%s|hidden=%t|geo=%s",
+		d.Key, d.Unique, d.Sparse, ttl, d.PartialFilter, d.Collation,
+		d.Weights, d.DefaultLanguage, d.LanguageOverride, d.WildcardProjection, d.Hidden, d.Geo,
 	)
 }
 
@@ -88,12 +107,92 @@ func canonicalizeIndex(spec bson.Raw) (IndexDescriptor, error) {
 		d.PartialFilter = hex.EncodeToString(h[:])
 	}
 	if coll, ok := spec.Lookup("collation").DocumentOK(); ok {
-		if locale, ok := coll.Lookup("locale").StringValueOK(); ok {
-			d.CollationLocale = locale
+		locale, canon, err := canonicalCollation(coll)
+		if err != nil {
+			return IndexDescriptor{}, fmt.Errorf("index %q: collation: %w", d.Name, err)
 		}
+		d.CollationLocale = locale
+		d.Collation = canon
 	}
+	if w, ok := spec.Lookup("weights").DocumentOK(); ok {
+		h, err := hashDoc(w)
+		if err != nil {
+			return IndexDescriptor{}, fmt.Errorf("index %q: weights: %w", d.Name, err)
+		}
+		d.Weights = hex.EncodeToString(h[:])
+	}
+	if s, ok := spec.Lookup("default_language").StringValueOK(); ok {
+		d.DefaultLanguage = s
+	}
+	if s, ok := spec.Lookup("language_override").StringValueOK(); ok {
+		d.LanguageOverride = s
+	}
+	if wp, ok := spec.Lookup("wildcardProjection").DocumentOK(); ok {
+		h, err := hashDoc(wp)
+		if err != nil {
+			return IndexDescriptor{}, fmt.Errorf("index %q: wildcardProjection: %w", d.Name, err)
+		}
+		d.WildcardProjection = hex.EncodeToString(h[:])
+	}
+	if b, ok := spec.Lookup("hidden").BooleanOK(); ok {
+		d.Hidden = b
+	}
+	d.Geo = canonicalGeo(spec)
 
 	return d, nil
+}
+
+// canonicalCollation extracts the collation locale and a canonical hash of the
+// collation document with the server-assigned "version" field removed. Excluding
+// version keeps a case-insensitive index distinguishable from a case-sensitive
+// one while avoiding a false mismatch when source and destination run different
+// server versions (which stamp different collation versions).
+func canonicalCollation(coll bson.Raw) (locale, canon string, err error) {
+	elems, err := coll.Elements()
+	if err != nil {
+		return "", "", err
+	}
+	filtered := make(bson.D, 0, len(elems))
+	for _, e := range elems {
+		k, err := e.KeyErr()
+		if err != nil {
+			return "", "", err
+		}
+		if k == "version" {
+			continue
+		}
+		if k == "locale" {
+			if s, ok := e.Value().StringValueOK(); ok {
+				locale = s
+			}
+		}
+		filtered = append(filtered, bson.E{Key: k, Value: e.Value()})
+	}
+	raw, err := bson.Marshal(filtered)
+	if err != nil {
+		return "", "", err
+	}
+	h, err := hashDoc(bson.Raw(raw))
+	if err != nil {
+		return "", "", err
+	}
+	return locale, hex.EncodeToString(h[:]), nil
+}
+
+// canonicalGeo renders the 2d/2dsphere geo options (bits, min, max) canonically,
+// or "" when none are present.
+func canonicalGeo(spec bson.Raw) string {
+	var parts []string
+	if b, ok := spec.Lookup("bits").AsInt64OK(); ok {
+		parts = append(parts, "bits="+strconv.FormatInt(b, 10))
+	}
+	if m, ok := spec.Lookup("min").AsFloat64OK(); ok {
+		parts = append(parts, "min="+strconv.FormatFloat(m, 'g', -1, 64))
+	}
+	if m, ok := spec.Lookup("max").AsFloat64OK(); ok {
+		parts = append(parts, "max="+strconv.FormatFloat(m, 'g', -1, 64))
+	}
+	return strings.Join(parts, ",")
 }
 
 // canonicalKey renders an index key document as an ordered "field:dir" list,

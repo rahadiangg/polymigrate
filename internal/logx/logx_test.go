@@ -9,14 +9,14 @@ import (
 
 func TestParseLevel(t *testing.T) {
 	cases := map[string]slog.Level{
-		"debug": slog.LevelDebug,
-		"DEBUG": slog.LevelDebug,
-		"info":  slog.LevelInfo,
-		"":      slog.LevelInfo,
-		"warn":  slog.LevelWarn,
+		"debug":   slog.LevelDebug,
+		"DEBUG":   slog.LevelDebug,
+		"info":    slog.LevelInfo,
+		"":        slog.LevelInfo,
+		"warn":    slog.LevelWarn,
 		"warning": slog.LevelWarn,
-		"error": slog.LevelError,
-		"bogus": slog.LevelInfo,
+		"error":   slog.LevelError,
+		"bogus":   slog.LevelInfo,
 	}
 	for in, want := range cases {
 		if got := ParseLevel(in); got != want {

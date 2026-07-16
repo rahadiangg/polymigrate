@@ -16,8 +16,8 @@ import (
 type LogReporter struct {
 	log *slog.Logger
 
-	mu       sync.Mutex
-	lastPct  map[string]int // ns -> last logged percentage, to throttle output
+	mu      sync.Mutex
+	lastPct map[string]int // ns -> last logged percentage, to throttle output
 }
 
 // NewLogReporter builds a LogReporter. A nil logger is replaced with a discarding one.
@@ -58,9 +58,9 @@ func (r *LogReporter) Progress(ns namespace.Namespace, done, total int64) {
 
 // CountingReporter records events for assertions in tests. Safe for concurrent use.
 type CountingReporter struct {
-	Phases      atomic.Int64
-	Events      atomic.Int64
-	ProgressN   atomic.Int64
+	Phases    atomic.Int64
+	Events    atomic.Int64
+	ProgressN atomic.Int64
 
 	mu        sync.Mutex
 	LastPhase engine.Phase

@@ -36,8 +36,8 @@ func Execute() int {
 // NewRootCmd builds the root command with all subcommands attached.
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:           "mm",
-		Short:         "mongomigrate — migrate MongoDB across flavors and topologies",
+		Use:   "mm",
+		Short: "mongomigrate — migrate MongoDB across flavors and topologies",
 		Long: "mm migrates data between any MongoDB-compatible deployments\n" +
 			"(standalone, replica set, sharded, Atlas, Huawei DDS, Percona) in any\n" +
 			"direction, with a native parallel copier, change-stream CDC for\n" +

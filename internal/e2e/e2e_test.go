@@ -58,7 +58,7 @@ func seed(t *testing.T, ctx context.Context, src, dst *mongox.Client) []namespac
 	orders := src.Database("e2e").Collection("orders")
 	docs := make([]any, 0, 2000)
 	for i := 0; i < 2000; i++ {
-		docs = append(docs, bson.D{{Key: "_id", Value: i}, {Key: "sku", Value: fmt.Sprintf("s-%d", i%40)}, {Key: "qty", Value: i%9}})
+		docs = append(docs, bson.D{{Key: "_id", Value: i}, {Key: "sku", Value: fmt.Sprintf("s-%d", i%40)}, {Key: "qty", Value: i % 9}})
 	}
 	if _, err := orders.InsertMany(ctx, docs); err != nil {
 		t.Fatalf("seed insert: %v", err)

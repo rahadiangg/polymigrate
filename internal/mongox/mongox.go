@@ -117,7 +117,10 @@ func Connect(ctx context.Context, uri string, co ConnectOptions) (*Client, error
 		return nil, fmt.Errorf("discover: %w", err)
 	}
 	if co.FlavorOverride != "" {
+		// Override the flavor AND recompute any flavor-dependent capability, so
+		// forcing e.g. cosmosdb/documentdb correctly disables change streams.
 		info.Flavor = co.FlavorOverride
+		info.SupportsChangeStreams = supportsChangeStreams(info.Topology, info.VersionArray, info.Flavor)
 	}
 	c.Info = info
 	return c, nil
@@ -334,33 +337,49 @@ func hostFromURI(uri string) string {
 	return s
 }
 
+// SkippedNamespace is a namespace that ListNamespaces did not return because it
+// is not a plain data collection (e.g. a view or a time-series collection, whose
+// data lives in a companion system.buckets.* collection the copier cannot read
+// directly). Callers should surface these so an operator knows they were not
+// migrated rather than assuming a clean sweep.
+type SkippedNamespace struct {
+	Namespace namespace.Namespace
+	Type      string // the collection spec Type, e.g. "view", "timeseries"
+}
+
 // ListNamespaces enumerates every collection across every database the user can
-// see, then applies the filter. System databases and views are handled by the
-// filter's ExcludeSystem flag.
-func (c *Client) ListNamespaces(ctx context.Context, filter *namespace.Filter) ([]namespace.Namespace, error) {
+// see, then applies the filter. It returns the matched plain collections and,
+// separately, any namespaces skipped because they are not plain collections
+// (views, time-series) so the caller can warn about them. System databases are
+// handled by the filter's ExcludeSystem flag.
+func (c *Client) ListNamespaces(ctx context.Context, filter *namespace.Filter) (matched []namespace.Namespace, skipped []SkippedNamespace, err error) {
 	dbNames, err := c.Client.ListDatabaseNames(ctx, bson.D{})
 	if err != nil {
-		return nil, fmt.Errorf("list databases: %w", err)
+		return nil, nil, fmt.Errorf("list databases: %w", err)
 	}
 
-	var out []namespace.Namespace
 	for _, dbName := range dbNames {
 		db := c.Client.Database(dbName)
-		// Only list real collections, not views, so the copier reads actual data.
 		specs, err := db.ListCollectionSpecifications(ctx, bson.D{})
 		if err != nil {
-			return nil, fmt.Errorf("list collections in %q: %w", dbName, err)
+			return nil, nil, fmt.Errorf("list collections in %q: %w", dbName, err)
 		}
 		for _, sp := range specs {
-			if sp.Type != "" && sp.Type != "collection" {
-				continue // skip views and timeseries virtual collections
-			}
 			ns := namespace.Namespace{DB: dbName, Collection: sp.Name}
+			// Only plain collections hold directly-copyable data. Report views and
+			// time-series collections as skipped (but only if they would otherwise
+			// have matched the filter, so we do not warn about irrelevant ones).
+			if sp.Type != "" && sp.Type != "collection" {
+				if filter == nil || filter.Match(ns) {
+					skipped = append(skipped, SkippedNamespace{Namespace: ns, Type: sp.Type})
+				}
+				continue
+			}
 			if filter == nil || filter.Match(ns) {
-				out = append(out, ns)
+				matched = append(matched, ns)
 			}
 		}
 	}
-	namespace.Sort(out)
-	return out, nil
+	namespace.Sort(matched)
+	return matched, skipped, nil
 }

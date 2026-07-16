@@ -137,21 +137,27 @@ func (d *realDstColl) writeBatch(ctx context.Context, docs []bson.Raw) (inserted
 	return 0, 0, len(docs), werr
 }
 
-// createIndexes builds each index individually so that a single already-existing
-// or conflicting index does not prevent the rest from being created.
+// createIndexes builds each index individually so that a single problematic
+// index does not prevent the rest from being created. Already-existing indexes
+// are ignored; any other per-index error is collected and reporting continues
+// with the next index, so one un-buildable index (e.g. a source-only feature the
+// destination rejects) cannot silently suppress every index after it. The joined
+// error is returned at the end alongside the count actually created.
 func (d *realDstColl) createIndexes(ctx context.Context, models []mongo.IndexModel) (int, error) {
 	created := 0
 	iv := d.coll.Indexes()
+	var errs []error
 	for _, m := range models {
 		if _, err := iv.CreateMany(ctx, []mongo.IndexModel{m}); err != nil {
 			if indexAlreadyExists(err) {
 				continue
 			}
-			return created, err
+			errs = append(errs, err)
+			continue
 		}
 		created++
 	}
-	return created, nil
+	return created, errors.Join(errs...)
 }
 
 // indexAlreadyExists reports whether err indicates the index (or an equivalent)

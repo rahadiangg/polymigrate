@@ -98,15 +98,21 @@ func openEndpoints(ctx context.Context, cfg config.Config, log *slog.Logger) (en
 	return e, nil
 }
 
-// resolveNamespaces lists source namespaces and applies the filter.
-func resolveNamespaces(ctx context.Context, src *mongox.Client, cfg config.Config) ([]namespace.Namespace, error) {
+// resolveNamespaces lists source namespaces and applies the filter. It warns
+// about any filter-matching namespaces that were skipped because they are not
+// plain collections (views, time-series), so they are not silently unmigrated.
+func resolveNamespaces(ctx context.Context, src *mongox.Client, cfg config.Config, log *slog.Logger) ([]namespace.Namespace, error) {
 	filter, err := cfg.Filter()
 	if err != nil {
 		return nil, err
 	}
-	ns, err := src.ListNamespaces(ctx, filter)
+	ns, skipped, err := src.ListNamespaces(ctx, filter)
 	if err != nil {
 		return nil, fmt.Errorf("resolve namespaces: %w", err)
+	}
+	for _, s := range skipped {
+		log.Warn("skipping non-collection namespace (not migrated)",
+			"ns", s.Namespace.String(), "type", s.Type)
 	}
 	if len(ns) == 0 {
 		return nil, fmt.Errorf("no source namespaces matched the include/exclude filters")

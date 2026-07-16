@@ -36,6 +36,12 @@ const defaultPollInterval = time.Second
 // more collections failed to copy. Callers can test for it with errors.Is.
 var ErrCopyFailed = errors.New("snapshot copy had collection failures")
 
+// ErrVerifyFailed is the sentinel wrapped when the verifier's own verdict
+// (VerifyReport.Ok) is false — i.e. the data does not match — even though the
+// verifier returned no transport error. A migration whose verification fails is
+// a failed migration. Callers can test for it with errors.Is.
+var ErrVerifyFailed = errors.New("verification reported a mismatch")
+
 // errApplyEndedEarly is returned when the tailer's Apply loop returns (without
 // an error of its own) before the orchestrator reached the end of cutover. It
 // signals that CDC stopped prematurely, which is a failure of the live flow.
@@ -148,17 +154,32 @@ func (e *Engine) runSnapshot(ctx context.Context, opts Options, rep Report) (Rep
 	}
 
 	if opts.RunVerify {
-		e.recordPhase(&rep, engine.PhaseVerify)
-		vr, verr := e.verifier.Verify(ctx, opts.Verify)
-		rep.Verify = vr
-		if verr != nil {
-			e.recordPhase(&rep, engine.PhaseFailed)
-			return rep, fmt.Errorf("verify: %w", verr)
+		if verr := e.verify(ctx, opts, &rep); verr != nil {
+			return rep, verr
 		}
 	}
 
 	e.recordPhase(&rep, engine.PhaseDone)
 	return rep, nil
+}
+
+// verify runs the verifier, records its report, and returns an error when the
+// verifier failed to run (transport error) OR when it ran successfully but its
+// verdict is a mismatch (VerifyReport.Ok == false). A migration that does not
+// verify is not a successful migration, so both cases record the Failed phase.
+func (e *Engine) verify(ctx context.Context, opts Options, rep *Report) error {
+	e.recordPhase(rep, engine.PhaseVerify)
+	vr, verr := e.verifier.Verify(ctx, opts.Verify)
+	rep.Verify = vr
+	if verr != nil {
+		e.recordPhase(rep, engine.PhaseFailed)
+		return fmt.Errorf("verify: %w", verr)
+	}
+	if !vr.Ok {
+		e.recordPhase(rep, engine.PhaseFailed)
+		return fmt.Errorf("verify: %w", ErrVerifyFailed)
+	}
+	return nil
 }
 
 // applyHandle tracks the background Apply goroutine. All of its fields are
@@ -252,9 +273,11 @@ func (e *Engine) runLive(ctx context.Context, opts Options, rep Report) (out Rep
 		}
 	}
 
-	// Final drain: apply the remaining buffered events until the lag is zero.
+	// Final drain: apply the remaining buffered events until the backlog is truly
+	// empty. Gate on Buffered==0 AND Lag<=0 (not lag alone) so a transient lag
+	// reading can never let the cutover stop the reader with events still pending.
 	if _, derr := e.pollUntil(ctx, ah, opts.PollInterval, report, func(s engine.TailStats) bool {
-		return s.Lag <= 0
+		return s.Buffered == 0 && s.Lag <= 0
 	}); derr != nil {
 		return rep, e.abort(ah, &rep, derr)
 	}
@@ -267,12 +290,8 @@ func (e *Engine) runLive(ctx context.Context, opts Options, rep Report) (out Rep
 	}
 
 	if opts.RunVerify {
-		e.recordPhase(&rep, engine.PhaseVerify)
-		vr, verr := e.verifier.Verify(ctx, opts.Verify)
-		rep.Verify = vr
-		if verr != nil {
-			e.recordPhase(&rep, engine.PhaseFailed)
-			return rep, fmt.Errorf("verify: %w", verr)
+		if verr := e.verify(ctx, opts, &rep); verr != nil {
+			return rep, verr
 		}
 	}
 

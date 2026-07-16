@@ -75,7 +75,7 @@ func newMigrateCmd() *cobra.Command {
 				return fmt.Errorf("source %s does not support change streams (need a replica set or sharded cluster on 3.6+); use --mode snapshot", eps.src.Info.String())
 			}
 
-			nss, err := resolveNamespaces(ctx, eps.src, cfg)
+			nss, err := resolveNamespaces(ctx, eps.src, cfg, log)
 			if err != nil {
 				return err
 			}

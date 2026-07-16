@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/weefer/mongomigrate/internal/engine"
@@ -261,19 +262,30 @@ func (s *clientStore) sampleIDs(ctx context.Context, ns namespace.Namespace, n i
 		return nil, nil
 	}
 	coll := s.cl.Database(ns.DB).Collection(ns.Collection)
-	cur, err := coll.Find(ctx, bson.D{}, options.Find().
-		SetSort(bson.D{{Key: "_id", Value: 1}}).
-		SetLimit(int64(n)).
-		SetProjection(bson.D{{Key: "_id", Value: 1}}))
-	if err != nil {
-		return nil, fmt.Errorf("sample %s: %w", ns, err)
-	}
-	defer cur.Close(ctx)
 
-	var docs []bson.Raw
-	if err := cur.All(ctx, &docs); err != nil {
-		return nil, fmt.Errorf("read sample %s: %w", ns, err)
+	// Prefer a RANDOM sample via $sample so content drift anywhere in the
+	// collection can be caught — a head-of-collection scan would only ever check
+	// the lowest _ids and silently miss drift elsewhere. Fall back to a
+	// deterministic sorted scan if $sample is unavailable (e.g. on a restricted
+	// managed API).
+	docs, err := readIDs(ctx, coll, mongo.Pipeline{
+		{{Key: "$sample", Value: bson.D{{Key: "size", Value: int64(n)}}}},
+		{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+	})
+	if err != nil {
+		cur, ferr := coll.Find(ctx, bson.D{}, options.Find().
+			SetSort(bson.D{{Key: "_id", Value: 1}}).
+			SetLimit(int64(n)).
+			SetProjection(bson.D{{Key: "_id", Value: 1}}))
+		if ferr != nil {
+			return nil, fmt.Errorf("sample %s: %w", ns, ferr)
+		}
+		defer cur.Close(ctx)
+		if ferr := cur.All(ctx, &docs); ferr != nil {
+			return nil, fmt.Errorf("read sample %s: %w", ns, ferr)
+		}
 	}
+
 	ids := make([]bson.RawValue, 0, len(docs))
 	for _, d := range docs {
 		rv, err := d.LookupErr("_id")
@@ -283,6 +295,20 @@ func (s *clientStore) sampleIDs(ctx context.Context, ns namespace.Namespace, n i
 		ids = append(ids, copyRawValue(rv))
 	}
 	return ids, nil
+}
+
+// readIDs runs an aggregation pipeline and returns the raw result documents.
+func readIDs(ctx context.Context, coll *mongo.Collection, pipe mongo.Pipeline) ([]bson.Raw, error) {
+	cur, err := coll.Aggregate(ctx, pipe)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var docs []bson.Raw
+	if err := cur.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+	return docs, nil
 }
 
 func (s *clientStore) fetchByIDs(ctx context.Context, ns namespace.Namespace, ids []bson.RawValue) (map[string]bson.Raw, error) {

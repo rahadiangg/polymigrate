@@ -237,18 +237,21 @@ func (t *Tailer) readLoop() {
 		}
 
 		ev.capturedAt = time.Now()
-		t.mu.Lock()
-		t.captured++
-		if !ev.At.IsZero() {
-			t.lastEventAt = ev.At
-		}
-		if len(tok) > 0 {
-			t.token = cloneBytes(tok)
-		}
-		t.mu.Unlock()
-
+		// Advance captured/lastEventAt/token ONLY once the event is safely buffered.
+		// If Stop cancels the stream while this event is in flight, we drop it
+		// without advancing the resume token past it, so a resumed stream
+		// re-delivers it rather than silently skipping it.
 		select {
 		case t.buffer <- ev:
+			t.mu.Lock()
+			t.captured++
+			if !ev.At.IsZero() {
+				t.lastEventAt = ev.At
+			}
+			if len(tok) > 0 {
+				t.token = cloneBytes(tok)
+			}
+			t.mu.Unlock()
 		case <-t.streamCtx.Done():
 			return
 		}
@@ -365,23 +368,44 @@ func (t *Tailer) applyBatch(ctx context.Context, batch []ChangeEvent) error {
 	return nil
 }
 
+// computeLag estimates apply lag from the backlog. It MUST return a strictly
+// positive duration whenever buffered>0, because the orchestrator treats Lag<=0
+// as "fully drained" and cuts over: a spurious zero while events remain buffered
+// would let the cutover stop the reader with events still unapplied and silently
+// lose data. oldestPendingAt is only set while a batch's head is in flight and is
+// reset to zero between batches, so this falls back to lastEventAt and finally to
+// a 1ns sentinel to preserve the invariant. It is zero only when buffered==0.
+func computeLag(buffered int64, oldestPendingAt, lastEventAt, now time.Time) time.Duration {
+	if buffered <= 0 {
+		return 0
+	}
+	switch {
+	case !oldestPendingAt.IsZero():
+		return positive(now.Sub(oldestPendingAt))
+	case !lastEventAt.IsZero():
+		return positive(now.Sub(lastEventAt))
+	default:
+		return time.Nanosecond
+	}
+}
+
+// positive clamps a duration to a strictly positive value, so a backlog never
+// reports Lag<=0 even if a clock read went backwards.
+func positive(d time.Duration) time.Duration {
+	if d <= 0 {
+		return time.Nanosecond
+	}
+	return d
+}
+
 // Stats returns a consistent snapshot of tailer progress. It is safe to call
 // concurrently with the running tailer.
 func (t *Tailer) Stats() engine.TailStats {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	buffered := t.captured - t.consumed
-	if buffered < 0 {
-		buffered = 0
-	}
-	// Lag is the wall-clock age of the oldest not-yet-applied event: zero when
-	// nothing is buffered, otherwise how long the current backlog's head has been
-	// waiting. It is an estimate, refined each time a batch is dequeued.
-	var lag time.Duration
-	if buffered > 0 && !t.oldestPendingAt.IsZero() {
-		lag = time.Since(t.oldestPendingAt)
-	}
+	buffered := max(t.captured-t.consumed, 0)
+	lag := computeLag(buffered, t.oldestPendingAt, t.lastEventAt, time.Now())
 
 	return engine.TailStats{
 		Captured:      t.captured,
@@ -421,11 +445,17 @@ func (t *Tailer) Stop() {
 func (t *Tailer) Close(ctx context.Context) error {
 	t.Stop()
 
+	// Stop cancelled the reader's stream context, so the reader exits promptly.
+	// Join it BEFORE touching the stream so Close never calls ChangeStream.Close
+	// concurrently with the reader's in-flight Next(). Do not key the wait off the
+	// caller's ctx (which is frequently already cancelled — that is exactly the
+	// case that used to trip the race); use an independent backstop instead so a
+	// misbehaving driver still cannot hang Close forever.
 	if t.readerDone != nil {
 		select {
 		case <-t.readerDone:
-		case <-ctx.Done():
-			// Fall through to close the stream even if joining timed out.
+		case <-time.After(30 * time.Second):
+			t.log.Warn("cdc: reader did not exit within 30s of Stop; closing stream anyway")
 		}
 	}
 
@@ -437,8 +467,12 @@ func (t *Tailer) Close(ctx context.Context) error {
 		return nil
 	}
 
+	// Close the stream with a fresh context so a cancelled caller ctx cannot abort
+	// the killCursors round-trip.
 	if t.source != nil {
-		if err := t.source.Close(ctx); err != nil {
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if err := t.source.Close(closeCtx); err != nil {
 			return fmt.Errorf("cdc: close change stream: %w", err)
 		}
 	}

@@ -124,9 +124,9 @@ func TestVersionArray(t *testing.T) {
 
 func TestAtLeast(t *testing.T) {
 	tests := []struct {
-		v          []int
-		maj, min   int
-		want       bool
+		v        []int
+		maj, min int
+		want     bool
 	}{
 		{[]int{4, 4}, 3, 6, true},
 		{[]int{3, 6}, 3, 6, true},

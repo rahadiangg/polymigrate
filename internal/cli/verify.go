@@ -47,7 +47,7 @@ func newVerifyCmd() *cobra.Command {
 			}
 			defer eps.close(context.Background())
 
-			nss, err := resolveNamespaces(ctx, eps.src, cfg)
+			nss, err := resolveNamespaces(ctx, eps.src, cfg, log)
 			if err != nil {
 				return err
 			}

@@ -108,9 +108,9 @@ func (c *Config) ApplyDefaults() {
 	if c.LagThreshold == 0 {
 		c.LagThreshold = d.LagThreshold
 	}
-	if c.SampleSize == 0 {
-		c.SampleSize = d.SampleSize
-	}
+	// SampleSize is intentionally NOT defaulted here: 0 is a meaningful value that
+	// means "skip content sampling". The CLI flag carries its own default (100)
+	// for the unset case, so an explicit --sample-size 0 must survive.
 	if c.LogLevel == "" {
 		c.LogLevel = d.LogLevel
 	}

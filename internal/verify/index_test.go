@@ -129,6 +129,75 @@ func TestCanonicalizeIndex_PartialAndCollation(t *testing.T) {
 	}
 }
 
+// TestSignatureDistinguishesRicherOptions covers the review fix: options beyond
+// key/unique/sparse/ttl/partial/locale must participate in equivalence, so a
+// genuinely different destination index cannot pass as a match.
+func TestSignatureDistinguishesRicherOptions(t *testing.T) {
+	base := func(extra ...bson.E) bson.Raw {
+		d := bson.D{
+			{Key: "key", Value: bson.D{{Key: "a", Value: int32(1)}}},
+			{Key: "name", Value: "a_1"},
+		}
+		return mustRaw(t, append(d, extra...))
+	}
+
+	cases := []struct {
+		name string
+		a, b bson.Raw
+	}{
+		{
+			"collation strength differs",
+			base(bson.E{Key: "collation", Value: bson.D{{Key: "locale", Value: "en"}, {Key: "strength", Value: int32(1)}}}),
+			base(bson.E{Key: "collation", Value: bson.D{{Key: "locale", Value: "en"}, {Key: "strength", Value: int32(2)}}}),
+		},
+		{
+			"hidden differs",
+			base(bson.E{Key: "hidden", Value: true}),
+			base(),
+		},
+		{
+			"wildcardProjection differs",
+			base(bson.E{Key: "wildcardProjection", Value: bson.D{{Key: "x", Value: int32(1)}}}),
+			base(bson.E{Key: "wildcardProjection", Value: bson.D{{Key: "y", Value: int32(1)}}}),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			da, err := canonicalizeIndex(tc.a)
+			if err != nil {
+				t.Fatalf("a: %v", err)
+			}
+			db, err := canonicalizeIndex(tc.b)
+			if err != nil {
+				t.Fatalf("b: %v", err)
+			}
+			if da.Signature() == db.Signature() {
+				t.Errorf("signatures must differ:\n a=%s\n b=%s", da.Signature(), db.Signature())
+			}
+		})
+	}
+}
+
+// TestCollationVersionIgnored covers the fix's guard against false mismatches:
+// the same collation with a different server-assigned "version" must be equal.
+func TestCollationVersionIgnored(t *testing.T) {
+	mk := func(ver string) bson.Raw {
+		return mustRaw(t, bson.D{
+			{Key: "key", Value: bson.D{{Key: "a", Value: int32(1)}}},
+			{Key: "name", Value: "a_1"},
+			{Key: "collation", Value: bson.D{{Key: "locale", Value: "en"}, {Key: "strength", Value: int32(2)}, {Key: "version", Value: ver}}},
+		})
+	}
+	d1, _ := canonicalizeIndex(mk("57.1"))
+	d2, _ := canonicalizeIndex(mk("58.0"))
+	if d1.Signature() != d2.Signature() {
+		t.Errorf("collation version must not affect equivalence:\n %s\n %s", d1.Signature(), d2.Signature())
+	}
+	if d1.CollationLocale != "en" {
+		t.Errorf("CollationLocale = %q, want en", d1.CollationLocale)
+	}
+}
+
 func TestDiffIndexes(t *testing.T) {
 	idx := func(name, key string, unique bool) IndexDescriptor {
 		return IndexDescriptor{Name: name, Key: key, Unique: unique}

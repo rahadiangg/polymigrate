@@ -62,6 +62,22 @@ func TestApplyDefaults(t *testing.T) {
 	}
 }
 
+// TestSampleSizeZeroSurvives covers the review fix: --sample-size 0 means "skip
+// content sampling" and must NOT be silently reset to the default by ApplyDefaults.
+func TestSampleSizeZeroSurvives(t *testing.T) {
+	c := Config{SampleSize: 0}
+	c.ApplyDefaults()
+	if c.SampleSize != 0 {
+		t.Errorf("SampleSize = %d after ApplyDefaults, want 0 (skip) preserved", c.SampleSize)
+	}
+	// A non-zero explicit value also survives.
+	c2 := Config{SampleSize: 42}
+	c2.ApplyDefaults()
+	if c2.SampleSize != 42 {
+		t.Errorf("SampleSize = %d, want 42", c2.SampleSize)
+	}
+}
+
 func TestParseYAML(t *testing.T) {
 	yamlDoc := `
 source:
