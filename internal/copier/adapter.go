@@ -65,6 +65,27 @@ func (s *realSrcColl) find(ctx context.Context, batch int) (docCursor, error) {
 	return &realCursor{cur: cur}, nil
 }
 
+// findFrom opens a cursor over the documents after the resume boundary. lastID is
+// the raw BSON of a {"_id": value} document (as produced by extractID); its _id
+// value drives a {_id: {$gt: value}} filter so the copy continues exactly where
+// it stopped. An empty lastID degrades to a full scan, matching find.
+func (s *realSrcColl) findFrom(ctx context.Context, batch int, lastID []byte) (docCursor, error) {
+	fo := options.Find().SetSort(bson.D{{Key: "_id", Value: 1}})
+	if batch > 0 {
+		fo.SetBatchSize(int32(batch))
+	}
+	filter := bson.D{}
+	if len(lastID) > 0 {
+		idVal := bson.Raw(lastID).Lookup("_id")
+		filter = bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: idVal}}}}
+	}
+	cur, err := s.coll.Find(ctx, filter, fo)
+	if err != nil {
+		return nil, err
+	}
+	return &realCursor{cur: cur}, nil
+}
+
 func (s *realSrcColl) listIndexes(ctx context.Context) ([]bson.Raw, error) {
 	cur, err := s.coll.Indexes().List(ctx)
 	if err != nil {
@@ -135,6 +156,54 @@ func (d *realDstColl) writeBatch(ctx context.Context, docs []bson.Raw) (inserted
 
 	// Non-bulk (e.g. transport) error: treat the whole batch as failed and abort.
 	return 0, 0, len(docs), werr
+}
+
+// writeBatchUpsert writes docs idempotently with an unordered bulk of
+// ReplaceOne(upsert) models keyed by _id. Because each write replaces (or
+// inserts) by _id, re-copying an overlapping boundary batch on resume neither
+// duplicates nor raises duplicate-key errors. A document without an _id cannot be
+// upserted deterministically and is counted as failed. A BulkWriteException is
+// decomposed into per-document failures (which do not abort the collection); any
+// non-bulk error (connection loss, etc.) is fatal and returned with the whole
+// batch counted failed.
+func (d *realDstColl) writeBatchUpsert(ctx context.Context, docs []bson.Raw) (written, failed int, err error) {
+	if len(docs) == 0 {
+		return 0, 0, nil
+	}
+	models := make([]mongo.WriteModel, 0, len(docs))
+	for _, doc := range docs {
+		idVal, lerr := doc.LookupErr("_id")
+		if lerr != nil {
+			failed++
+			continue
+		}
+		filter := bson.D{{Key: "_id", Value: idVal}}
+		models = append(models, mongo.NewReplaceOneModel().
+			SetFilter(filter).
+			SetReplacement(doc).
+			SetUpsert(true))
+	}
+	if len(models) == 0 {
+		return 0, failed, nil
+	}
+
+	_, werr := d.coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	if werr == nil {
+		return len(models), failed, nil
+	}
+
+	var bwe mongo.BulkWriteException
+	if errors.As(werr, &bwe) {
+		bad := len(bwe.WriteErrors)
+		written = len(models) - bad
+		if written < 0 {
+			written = 0
+		}
+		return written, failed + bad, nil
+	}
+
+	// Non-bulk (e.g. transport) error: treat every model as failed and abort.
+	return 0, failed + len(models), werr
 }
 
 // createIndexes builds each index individually so that a single problematic
