@@ -96,10 +96,36 @@ writes() {
   "
 }
 
+# --- Fault injection helpers (for the resilience-tier integration tests) ---
+
+wait_dst_primary() {
+  for i in $(seq 1 60); do
+    if docker exec mm-dst mongosh --quiet --port ${DST_PORT} --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true; then
+      echo "   mm-dst primary"; return 0
+    fi
+    sleep 1
+  done
+  echo "   mm-dst no primary"; return 1
+}
+
+# Pause the destination process (SIGSTOP) — simulates a transient outage that
+# retry/backoff should ride out. Pair with unpause-dst.
+pause_dst()   { docker pause mm-dst   >/dev/null && echo "mm-dst paused"; }
+unpause_dst() { docker unpause mm-dst >/dev/null && echo "mm-dst unpaused"; }
+
+# Hard-stop the destination container — simulates the destination dying.
+kill_dst()    { docker stop -t 0 mm-dst >/dev/null && echo "mm-dst stopped"; }
+# Bring the destination back and wait for its primary.
+restart_dst() { docker start mm-dst >/dev/null && echo "mm-dst started" && wait_dst_primary; }
+
 case "${1:-up}" in
   up) up && seed ;;
   seed) seed ;;
   writes) writes "${2:-500}" ;;
+  pause-dst) pause_dst ;;
+  unpause-dst) unpause_dst ;;
+  kill-dst) kill_dst ;;
+  restart-dst) restart_dst ;;
   down) teardown; echo "torn down" ;;
-  *) echo "usage: $0 {up|seed|writes N|down}"; exit 1 ;;
+  *) echo "usage: $0 {up|seed|writes N|pause-dst|unpause-dst|kill-dst|restart-dst|down}"; exit 1 ;;
 esac
