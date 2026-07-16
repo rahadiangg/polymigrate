@@ -38,6 +38,15 @@ func parseEvent(raw bson.Raw) (ChangeEvent, error) {
 	}
 	e.OpType = op
 
+	// The change event document's own _id IS this event's resume token. Capture its
+	// raw document bytes so a resume can restart the stream exactly after it. Like
+	// ID and Full, this aliases raw's backing bytes.
+	if idVal, err := raw.LookupErr("_id"); err == nil {
+		if doc, ok := idVal.DocumentOK(); ok {
+			e.Token = []byte(doc)
+		}
+	}
+
 	if nsVal, err := raw.LookupErr("ns"); err == nil {
 		if nsDoc, ok := nsVal.DocumentOK(); ok {
 			db, _ := nsDoc.Lookup("db").StringValueOK()

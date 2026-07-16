@@ -1,6 +1,7 @@
 package cdc
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
@@ -79,6 +80,47 @@ func TestParseEvent_Insert(t *testing.T) {
 	wantAt := time.Unix(1_700_000_000, 0).UTC()
 	if !e.At.Equal(wantAt) {
 		t.Errorf("At = %v, want %v", e.At, wantAt)
+	}
+}
+
+func TestParseEvent_Token(t *testing.T) {
+	// The change event document's own _id is a {_data: ...} resume-token document.
+	tokenDoc := bson.D{{Key: "_data", Value: "826A1B2C3D000000012B022C0100296E5A10"}}
+	full := bson.D{{Key: "_id", Value: 7}, {Key: "name", Value: "ada"}}
+	d := bson.D{
+		{Key: "_id", Value: tokenDoc},
+		{Key: "operationType", Value: opInsert},
+		{Key: "ns", Value: bson.D{{Key: "db", Value: "shop"}, {Key: "coll", Value: "users"}}},
+		{Key: "documentKey", Value: bson.D{{Key: "_id", Value: 7}}},
+		{Key: "fullDocument", Value: full},
+	}
+	raw := rawDoc(t, d)
+
+	e, err := parseEvent(raw)
+	if err != nil {
+		t.Fatalf("parseEvent: %v", err)
+	}
+	// Token must be the raw BSON of the change doc's _id, byte-identical to the
+	// standalone-marshaled resume-token document (usable with SetResumeAfter).
+	want := rawDoc(t, tokenDoc)
+	if !bytes.Equal(e.Token, want) {
+		t.Errorf("Token = %x, want %x", e.Token, []byte(want))
+	}
+	// The document-key _id (7) must remain distinct from the resume token.
+	if got, ok := e.ID.Int32OK(); !ok || got != 7 {
+		t.Errorf("documentKey ID = %v (ok=%v), want 7", got, ok)
+	}
+}
+
+func TestParseEvent_TokenAbsent(t *testing.T) {
+	// A synthetic event with no top-level _id yields an empty Token.
+	raw := eventRaw(t, opInsert, "d", "c", 1, bson.D{{Key: "_id", Value: 1}}, nil)
+	e, err := parseEvent(raw)
+	if err != nil {
+		t.Fatalf("parseEvent: %v", err)
+	}
+	if len(e.Token) != 0 {
+		t.Errorf("Token = %x, want empty when the event carries no _id", e.Token)
 	}
 }
 

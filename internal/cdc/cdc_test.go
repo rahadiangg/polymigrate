@@ -3,13 +3,16 @@ package cdc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/weefer/mongomigrate/internal/engine"
+	"github.com/weefer/mongomigrate/internal/mongox"
 	"github.com/weefer/mongomigrate/internal/namespace"
 	"github.com/weefer/mongomigrate/internal/progress"
 )
@@ -96,10 +99,11 @@ func (f *fakeSource) Close(context.Context) error {
 // memApplier is an in-memory destination that mirrors Mongo's replace/delete
 // semantics so tests can assert the final sink state and idempotency.
 type memApplier struct {
-	mu         sync.Mutex
-	docs       map[string]bson.Raw
-	applyCalls int
-	blockUntil chan struct{} // when non-nil, apply blocks on it (to force backlog)
+	mu            sync.Mutex
+	docs          map[string]bson.Raw
+	applyCalls    int
+	blockUntil    chan struct{} // when non-nil, apply blocks on it (to force backlog)
+	appliedTokens [][]byte      // resume tokens of applied events, in apply order
 }
 
 func newMemApplier() *memApplier {
@@ -122,6 +126,9 @@ func (m *memApplier) apply(ctx context.Context, batch []ChangeEvent) (int, int, 
 		if _, ok := eventToModel(e); !ok {
 			continue
 		}
+		if len(e.Token) > 0 {
+			m.appliedTokens = append(m.appliedTokens, append([]byte(nil), e.Token...))
+		}
 		k := idKey(e)
 		if e.OpType == opDelete {
 			delete(m.docs, k)
@@ -138,6 +145,54 @@ func (m *memApplier) count() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.docs)
+}
+
+// tokenOrder returns a copy of the resume tokens of applied events, in the order
+// they were applied.
+func (m *memApplier) tokenOrder() [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([][]byte, len(m.appliedTokens))
+	copy(out, m.appliedTokens)
+	return out
+}
+
+// tokenRecorder captures the tokens delivered to TailOptions.OnToken. It is safe
+// for concurrent use because OnToken may be called from the apply goroutine.
+type tokenRecorder struct {
+	mu     sync.Mutex
+	tokens [][]byte
+}
+
+func (r *tokenRecorder) record(tok engine.ResumeToken) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tokens = append(r.tokens, append([]byte(nil), tok...))
+}
+
+func (r *tokenRecorder) len() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.tokens)
+}
+
+func (r *tokenRecorder) all() [][]byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([][]byte, len(r.tokens))
+	copy(out, r.tokens)
+	return out
+}
+
+// tokenFor builds a deterministic, distinct per-event resume token.
+func tokenFor(i int) []byte { return []byte(fmt.Sprintf("tok-%03d", i)) }
+
+// dataEventTok is dataEvent with a per-event resume Token attached.
+func dataEventTok(t *testing.T, op, db, coll string, id int, token []byte) ChangeEvent {
+	t.Helper()
+	e := dataEvent(t, op, db, coll, id)
+	e.Token = token
+	return e
 }
 
 // errApplier always fails, to exercise Apply's error propagation.
@@ -618,6 +673,251 @@ func TestResumeTokenSeeded(t *testing.T) {
 	}
 	tl.Stop()
 	_ = tl.Close(ctx)
+}
+
+// TestOnToken_NeverAheadOfApplied is the checkpoint-ordering invariant: OnToken
+// must only ever receive the token of an event that has ALREADY been applied to the
+// destination — never a token the reader captured ahead of a slow applier. Losing
+// that ordering would let a resumed stream skip unapplied events and drop data.
+func TestOnToken_NeverAheadOfApplied(t *testing.T) {
+	src := newFakeSource(64)
+	app := newMemApplier()
+	app.blockUntil = make(chan struct{})
+	tl := newTestTailer(src, app, nil)
+
+	// An ever-advancing clock so the 1/sec throttle never suppresses an emit: every
+	// applied batch checkpoints its token, making the ordering observable.
+	var clkMu sync.Mutex
+	clk := time.Unix(0, 0)
+	tl.now = func() time.Time {
+		clkMu.Lock()
+		defer clkMu.Unlock()
+		clk = clk.Add(2 * time.Second)
+		return clk
+	}
+
+	rec := &tokenRecorder{}
+	// Each delivered token must equal the LAST APPLIED event's token at the instant
+	// OnToken fires — never the captured-ahead token. Because recordAppliedToken runs
+	// right after applier.apply returns (same goroutine), the applier's last recorded
+	// token is exactly the batch just written. A bug that checkpointed the captured
+	// token (which has raced ahead to tokenFor(n)) would violate this immediately.
+	onToken := func(tok engine.ResumeToken) {
+		order := app.tokenOrder()
+		if len(order) == 0 {
+			t.Errorf("OnToken fired before any event was applied: %q", tok)
+		} else if want := order[len(order)-1]; string(tok) != string(want) {
+			t.Errorf("OnToken = %q, but last APPLIED token is %q (token ran ahead of applied data)", tok, want)
+		}
+		rec.record(tok)
+	}
+	ctx := context.Background()
+	if err := tl.Open(ctx, engine.TailOptions{ApplyBatchSize: 1, BufferSize: 64, OnToken: onToken}); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	const n = 8
+	for i := 1; i <= n; i++ {
+		src.push(scriptItem{ev: dataEventTok(t, opInsert, "d", "c", i, tokenFor(i)), token: tokenFor(i)})
+	}
+
+	applyErr := make(chan error, 1)
+	go func() { applyErr <- tl.Apply(ctx) }()
+
+	// The reader races ahead of the blocked applier: all n events are captured and
+	// the CAPTURED token has reached the last event, yet NO applied token has been
+	// emitted. This is the core proof that OnToken never runs ahead of applied data.
+	waitFor(t, func() bool { return tl.Stats().Captured == n })
+	if got := tl.Token(); string(got) != string(tokenFor(n)) {
+		t.Fatalf("captured Token = %q, want %q (reader should be ahead)", got, tokenFor(n))
+	}
+	if got := rec.len(); got != 0 {
+		t.Fatalf("OnToken emitted %d tokens while the applier was blocked; it must never run ahead of applied data", got)
+	}
+
+	close(app.blockUntil) // let the applier drain the backlog
+	if err := waitStopped(t, ctx, tl, applyErr); err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+
+	// Every emitted token corresponds to an already-applied event, in non-decreasing
+	// apply order, and the final token is the last applied event's token.
+	emitted := rec.all()
+	if len(emitted) == 0 {
+		t.Fatal("no applied tokens were emitted")
+	}
+	pos := make(map[string]int)
+	for i, tok := range app.tokenOrder() {
+		pos[string(tok)] = i
+	}
+	last := -1
+	for _, tok := range emitted {
+		p, ok := pos[string(tok)]
+		if !ok {
+			t.Fatalf("emitted token %q was never applied (ran ahead of applied data)", tok)
+		}
+		if p < last {
+			t.Fatalf("emitted tokens not in apply order: %q at apply pos %d after %d", tok, p, last)
+		}
+		last = p
+	}
+	if final := emitted[len(emitted)-1]; string(final) != string(tokenFor(n)) {
+		t.Errorf("final emitted token = %q, want %q (last applied)", final, tokenFor(n))
+	}
+	_ = tl.Close(ctx)
+}
+
+// TestOnToken_Throttle asserts OnToken is throttled to at most once per second, yet
+// always flushes the final applied token when Apply stops. With a frozen clock only
+// the first batch clears the throttle, so exactly two tokens surface: the first and
+// the forced final flush.
+func TestOnToken_Throttle(t *testing.T) {
+	src := newFakeSource(16)
+	app := newMemApplier()
+	tl := newTestTailer(src, app, nil)
+
+	frozen := time.Unix(1000, 0)
+	tl.now = func() time.Time { return frozen }
+
+	rec := &tokenRecorder{}
+	ctx := context.Background()
+	if err := tl.Open(ctx, engine.TailOptions{ApplyBatchSize: 1, OnToken: rec.record}); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	const n = 5
+	for i := 1; i <= n; i++ {
+		src.push(scriptItem{ev: dataEventTok(t, opInsert, "d", "c", i, tokenFor(i))})
+	}
+
+	applyErr := make(chan error, 1)
+	go func() { applyErr <- tl.Apply(ctx) }()
+	waitFor(t, func() bool { return tl.Stats().Applied == n && tl.Stats().Buffered == 0 })
+	if err := waitStopped(t, ctx, tl, applyErr); err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+
+	got := rec.all()
+	if len(got) != 2 {
+		t.Fatalf("emitted %d tokens, want 2 (first batch + forced final flush)", len(got))
+	}
+	if string(got[0]) != string(tokenFor(1)) {
+		t.Errorf("first emit = %q, want %q", got[0], tokenFor(1))
+	}
+	if string(got[1]) != string(tokenFor(n)) {
+		t.Errorf("final emit = %q, want %q (last applied)", got[1], tokenFor(n))
+	}
+	_ = tl.Close(ctx)
+}
+
+// TestOnToken_NilGuard confirms a nil OnToken is tolerated end to end.
+func TestOnToken_NilGuard(t *testing.T) {
+	src := newFakeSource(16)
+	app := newMemApplier()
+	tl := newTestTailer(src, app, nil)
+
+	ctx := context.Background()
+	if err := tl.Open(ctx, engine.TailOptions{ApplyBatchSize: 1}); err != nil { // OnToken nil
+		t.Fatalf("Open: %v", err)
+	}
+	src.push(scriptItem{ev: dataEventTok(t, opInsert, "d", "c", 1, tokenFor(1))})
+
+	applyErr := make(chan error, 1)
+	go func() { applyErr <- tl.Apply(ctx) }()
+	waitFor(t, func() bool { return tl.Stats().Applied == 1 })
+	if err := waitStopped(t, ctx, tl, applyErr); err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	_ = tl.Close(ctx)
+}
+
+// TestOpen_PassesResumeToSource asserts the resume token from TailOptions.Resume is
+// handed to the source factory (which wires it to SetResumeAfter).
+func TestOpen_PassesResumeToSource(t *testing.T) {
+	var gotOpts engine.TailOptions
+	fs := newFakeSource(1)
+
+	tl := New(nil, nil, nil, nil)
+	tl.sourceFactory = func(_ context.Context, _ *mongox.Client, opts engine.TailOptions) (eventSource, error) {
+		gotOpts = opts
+		return fs, nil
+	}
+
+	ctx := context.Background()
+	resume := engine.ResumeToken("resume-token-xyz")
+	if err := tl.Open(ctx, engine.TailOptions{Resume: resume}); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if string(gotOpts.Resume) != string(resume) {
+		t.Errorf("factory received Resume = %q, want %q", gotOpts.Resume, resume)
+	}
+	// And Token() reflects the seeded resume token before any event advances it.
+	if tok := tl.Token(); string(tok) != string(resume) {
+		t.Errorf("Token = %q, want seeded %q", tok, resume)
+	}
+	tl.Stop()
+	_ = tl.Close(ctx)
+}
+
+// TestApply_ChangeStreamHistoryLost asserts a 286 (ChangeStreamHistoryLost) read
+// error surfaces from Apply as the exported sentinel, matchable with errors.Is, so
+// the orchestrator can mark the run non-resumable.
+func TestApply_ChangeStreamHistoryLost(t *testing.T) {
+	src := newFakeSource(16)
+	app := newMemApplier()
+	tl := newTestTailer(src, app, nil)
+
+	ctx := context.Background()
+	if err := tl.Open(ctx, engine.TailOptions{ApplyBatchSize: 4}); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	historyLost := mongo.CommandError{
+		Code:    286,
+		Name:    "ChangeStreamHistoryLost",
+		Message: "resume of change stream was not possible, as the resume point may no longer be in the oplog",
+	}
+	src.push(
+		scriptItem{ev: dataEvent(t, opInsert, "d", "c", 1)},
+		scriptItem{err: historyLost},
+	)
+
+	applyErr := make(chan error, 1)
+	go func() { applyErr <- tl.Apply(ctx) }()
+
+	select {
+	case err := <-applyErr:
+		if !errors.Is(err, ErrChangeStreamHistoryLost) {
+			t.Fatalf("Apply err = %v, want wrapping ErrChangeStreamHistoryLost", err)
+		}
+		// The underlying command error is preserved in the chain too.
+		var ce mongo.CommandError
+		if !errors.As(err, &ce) || ce.Code != 286 {
+			t.Errorf("underlying CommandError (code 286) not preserved: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Apply did not return after history-lost error")
+	}
+	_ = tl.Close(ctx)
+}
+
+// TestIsChangeStreamHistoryLost is a focused table test of the 286 classifier.
+func TestIsChangeStreamHistoryLost(t *testing.T) {
+	if isChangeStreamHistoryLost(nil) {
+		t.Error("nil must not be history-lost")
+	}
+	if isChangeStreamHistoryLost(errors.New("history lost 286")) {
+		t.Error("a plain error mentioning 286 must not be classified as history-lost")
+	}
+	if !isChangeStreamHistoryLost(mongo.CommandError{Code: 286}) {
+		t.Error("CommandError code 286 must be history-lost")
+	}
+	if !isChangeStreamHistoryLost(fmt.Errorf("wrap: %w", mongo.CommandError{Code: 286})) {
+		t.Error("wrapped CommandError code 286 must be history-lost")
+	}
+	if isChangeStreamHistoryLost(mongo.CommandError{Code: 11000}) {
+		t.Error("a duplicate-key CommandError must not be history-lost")
+	}
 }
 
 // waitFor polls cond until true or a timeout, failing the test on timeout. It
