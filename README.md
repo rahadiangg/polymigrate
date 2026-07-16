@@ -128,6 +128,41 @@ and restart.
   safe. The copier treats duplicate-key as already-present, so a `--mode snapshot`
   re-run *without* `--drop` is safe.
 
+## Resilience — surviving crashes and outages
+
+A migration checkpoints its progress durably, so it survives the death of the
+source, the destination, or `mm` itself, and rides out transient outages.
+
+- **Checkpointing is on by default.** Progress (per-collection snapshot position +
+  the last *applied* CDC token) is written to a `_mongomigrate.checkpoints`
+  collection on the destination and mirrored to a local `.mm-checkpoints/` file.
+- **Resume** a crashed or interrupted run:
+  ```bash
+  mm migrate --src ... --dst ... --mode live --resume
+  ```
+  Completed collections are skipped, an in-progress one continues from its last
+  `_id`, and (live) the change stream resumes from the checkpointed token.
+  Snapshot copy on resume uses idempotent upserts, so the boundary batch is safe
+  to re-copy — no data is lost or duplicated. `--resume` never drops.
+- **Inspect / clear** a run:
+  ```bash
+  mm status --run-id <id>          # per-collection progress + resumable flag
+  mm checkpoint clear --run-id <id>
+  ```
+  The run id is printed at startup and defaults to a stable hash of
+  (source, destination, filter); override with `--run-id`. Disable checkpointing
+  with `--no-checkpoint`.
+- **Transient outages** (a brief destination pause, a primary step-down) are
+  absorbed by bounded exponential-backoff retry on the write paths; the retried
+  writes are idempotent, so recovery is safe.
+- **The cardinal safety invariant**: the checkpointed CDC token is only ever
+  advanced *after* the corresponding events are applied to the destination, so a
+  resume can only ever re-apply already-applied events (idempotent) — never skip
+  unapplied ones.
+- **Lost change-stream history** (source oplog rolled past the resume point, error
+  286) is reported as a distinct, fatal error and the run is marked non-resumable:
+  a fresh snapshot is required rather than a silent, incomplete resume.
+
 ## Limitations (by design / MongoDB constraints)
 
 - **The cutover needs a brief write freeze.** Live mode shrinks downtime to the

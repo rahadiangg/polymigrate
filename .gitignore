@@ -12,3 +12,6 @@ coverage.html
 # Local env
 .env
 *.local.yaml
+
+# Checkpoint mirror
+.mm-checkpoints/
