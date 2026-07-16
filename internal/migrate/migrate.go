@@ -240,6 +240,9 @@ func (e *Engine) setupCheckpoint(ctx context.Context, opts *Options) error {
 // skipped, in-progress ones resume from their last _id, and the change stream
 // resumes from the saved token.
 func applyResume(opts *Options, prev checkpoint.State) {
+	// Never drop on resume: the destination already holds the data copied so far,
+	// and dropping would discard a completed (skipped) or in-progress collection.
+	opts.Copy.DropTarget = false
 	if opts.Copy.SkipNamespaces == nil {
 		opts.Copy.SkipNamespaces = map[string]bool{}
 	}
