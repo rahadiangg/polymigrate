@@ -1,0 +1,14 @@
+# Binaries
+/mm
+/bin/
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.txt
+coverage.html
+
+# Local env
+.env
+*.local.yaml
