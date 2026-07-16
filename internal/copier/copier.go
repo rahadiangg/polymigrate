@@ -41,6 +41,11 @@ type srcColl interface {
 	// find opens a cursor over all documents sorted by _id. batch is the source
 	// cursor batch size; <=0 means the driver default.
 	find(ctx context.Context, batch int) (docCursor, error)
+	// findFrom opens a cursor over the documents whose _id is strictly greater than
+	// lastID, sorted by _id. lastID is the raw BSON produced by extractID (a
+	// single-element {"_id": value} document); an empty lastID selects all
+	// documents. It is the resume-mode counterpart of find.
+	findFrom(ctx context.Context, batch int, lastID []byte) (docCursor, error)
 	// listIndexes returns the raw index specifications for this collection.
 	listIndexes(ctx context.Context) ([]bson.Raw, error)
 }
@@ -67,6 +72,14 @@ type dstColl interface {
 	// collection; per-document write errors are reported via the failed count with
 	// a nil error so the copy can continue.
 	writeBatch(ctx context.Context, docs []bson.Raw) (inserted, dupes, failed int, err error)
+	// writeBatchUpsert writes docs idempotently via ReplaceOne(upsert) keyed by
+	// _id, so re-copying an overlapping (boundary) batch on resume neither
+	// duplicates nor fails. It reports how many documents were written (inserted or
+	// replaced) and how many failed for other write-level reasons. As with
+	// writeBatch, a non-nil error is a fatal problem that aborts the collection,
+	// while per-document failures are surfaced via the failed count with a nil
+	// error so the copy can continue.
+	writeBatchUpsert(ctx context.Context, docs []bson.Raw) (written, failed int, err error)
 	// createIndexes creates the given index models, tolerating any that already
 	// exist, and returns how many were created.
 	createIndexes(ctx context.Context, models []mongo.IndexModel) (int, error)
@@ -190,6 +203,16 @@ func (c *Copier) copyCollection(ctx context.Context, ns namespace.Namespace, opt
 		return finish()
 	}
 
+	// Resume fast-path: a namespace recorded as fully copied on a prior run is
+	// skipped entirely. It is marked Skipped so callers can tell it apart from a
+	// freshly-copied collection; OnProgress is not re-invoked (it already fired
+	// with done=true on the run that completed it).
+	if opts.SkipNamespaces[ns.String()] {
+		res.Skipped = true
+		c.reporter.Event("collection skipped (resumed: already complete)", "ns", ns.String())
+		return finish()
+	}
+
 	c.reporter.Event("collection started", "ns", ns.String())
 
 	src := c.factory.srcColl(ns)
@@ -220,7 +243,7 @@ func (c *Copier) copyCollection(ctx context.Context, ns namespace.Namespace, opt
 		total = n
 	}
 
-	if err := c.copyData(ctx, ns, src, dst, opts.ReadBatchSize, batchSize, total, &res); err != nil {
+	if err := c.copyData(ctx, ns, src, dst, opts, batchSize, total, &res); err != nil {
 		// copyData already recorded res.Err; nothing more to do but finish.
 		return finish()
 	}
@@ -236,8 +259,31 @@ func (c *Copier) copyCollection(ctx context.Context, ns namespace.Namespace, opt
 // res as it goes. It returns a non-nil error (and sets res.Err) only for a fatal
 // per-collection problem; in-batch document failures are accumulated into
 // res.DocsFailed and are not returned as errors.
-func (c *Copier) copyData(ctx context.Context, ns namespace.Namespace, src srcColl, dst dstColl, readBatch, batchSize int, total int64, res *engine.CollectionCopyResult) error {
-	cur, err := src.find(ctx, readBatch)
+//
+// When the namespace appears in opts.ResumeFrom it runs in resume mode: the
+// source cursor starts after the last copied _id ({_id: {$gt: lastID}}) and
+// writes go through the idempotent upsert path so re-copying the boundary batch
+// is safe. A namespace absent from ResumeFrom keeps the original fast
+// InsertMany + duplicate-key-tolerance path unchanged.
+//
+// After every successfully-written batch it records the batch's last _id and, if
+// opts.OnProgress is set, reports it with the running doc count (done=false); on
+// clean completion it reports once more with done=true so the orchestrator can
+// checkpoint the namespace as finished. The resume boundary is only advanced
+// past a batch that wrote with zero failures, so a resumed run never skips a
+// document that failed to copy.
+func (c *Copier) copyData(ctx context.Context, ns namespace.Namespace, src srcColl, dst dstColl, opts engine.CopyOptions, batchSize int, total int64, res *engine.CollectionCopyResult) error {
+	resumeID, resuming := opts.ResumeFrom[ns.String()]
+
+	var (
+		cur docCursor
+		err error
+	)
+	if resuming {
+		cur, err = src.findFrom(ctx, opts.ReadBatchSize, resumeID)
+	} else {
+		cur, err = src.find(ctx, opts.ReadBatchSize)
+	}
 	if err != nil {
 		res.Err = fmt.Errorf("open source cursor %s: %w", ns, err).Error()
 		return err
@@ -247,22 +293,50 @@ func (c *Copier) copyData(ctx context.Context, ns namespace.Namespace, src srcCo
 	defer func() { _ = cur.Close(context.Background()) }()
 
 	batch := make([]bson.Raw, 0, batchSize)
+	// lastID is the resume boundary: the raw BSON of the greatest _id copied so
+	// far. It only advances past cleanly-written batches.
+	var lastID []byte
 
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
-		inserted, dupes, failed, werr := dst.writeBatch(ctx, batch)
-		// Duplicates are treated as already-present documents, so they count as
-		// copied — this keeps re-runs without --drop safe.
-		res.DocsCopied += int64(inserted) + int64(dupes)
+		// The cursor yields documents sorted by _id, so the final document in the
+		// batch carries the greatest _id and is the candidate new boundary.
+		last := batch[len(batch)-1]
+
+		var failed int
+		var werr error
+		if resuming {
+			var written int
+			written, failed, werr = dst.writeBatchUpsert(ctx, batch)
+			res.DocsCopied += int64(written)
+		} else {
+			// Duplicates are treated as already-present documents, so they count as
+			// copied — this keeps re-runs without --drop safe.
+			inserted, dupes, f, e := dst.writeBatch(ctx, batch)
+			res.DocsCopied += int64(inserted) + int64(dupes)
+			failed, werr = f, e
+		}
 		res.DocsFailed += int64(failed)
 		batch = batch[:0]
 		if werr != nil {
 			res.Err = fmt.Errorf("write batch %s: %w", ns, werr).Error()
 			return werr
 		}
+		// Only advance the checkpoint boundary when the whole batch was written
+		// cleanly; otherwise a resume could skip a document that failed here.
+		if failed == 0 {
+			if id, iderr := extractID(last); iderr == nil {
+				lastID = id
+			} else {
+				c.log.Warn("cannot extract _id for resume checkpoint", "ns", ns.String(), "err", iderr)
+			}
+		}
 		c.reporter.Progress(ns, res.DocsCopied, total)
+		if opts.OnProgress != nil {
+			opts.OnProgress(ns, lastID, res.DocsCopied, false)
+		}
 		return nil
 	}
 
@@ -291,7 +365,31 @@ func (c *Copier) copyData(ctx context.Context, ns namespace.Namespace, src srcCo
 	if err := flush(); err != nil {
 		return err
 	}
+	// Signal the namespace's data copy is complete so the orchestrator can mark
+	// it done in the checkpoint.
+	if opts.OnProgress != nil {
+		opts.OnProgress(ns, lastID, res.DocsCopied, true)
+	}
 	return nil
+}
+
+// extractID returns the raw BSON encoding of a document's _id, wrapped as a
+// single-element {"_id": value} document. Wrapping preserves the value's BSON
+// type (so an ObjectID, int, string, or compound _id all round-trip) and lets
+// the value be reconstructed into a {_id: {$gt: ...}} resume filter with a plain
+// bson.Raw lookup. It is a pure function so the resume-boundary logic is
+// unit-testable without a live server. It returns an error when the document has
+// no _id.
+func extractID(doc bson.Raw) ([]byte, error) {
+	val, err := doc.LookupErr("_id")
+	if err != nil {
+		return nil, fmt.Errorf("document has no _id: %w", err)
+	}
+	out, err := bson.Marshal(bson.D{{Key: "_id", Value: val}})
+	if err != nil {
+		return nil, fmt.Errorf("marshal _id: %w", err)
+	}
+	return out, nil
 }
 
 // copyIndexes reads the source index specifications, reconstructs index models

@@ -95,9 +95,11 @@ type fakeSrcColl struct {
 	cancelAt   int
 	decodeErr  int // passed to cursor; -1 = never
 
-	mu         sync.Mutex
-	lastCursor *fakeCursor
-	findBatch  int // records the batch size the copier requested
+	mu           sync.Mutex
+	lastCursor   *fakeCursor
+	findBatch    int    // records the batch size the copier requested
+	findFromLast []byte // records the resume boundary passed to findFrom
+	findFromCall bool   // records that findFrom (not find) was used
 }
 
 func (s *fakeSrcColl) count(ctx context.Context) (int64, error) {
@@ -129,6 +131,44 @@ func (s *fakeSrcColl) find(ctx context.Context, batch int) (docCursor, error) {
 	return cur, nil
 }
 
+// findFrom mirrors find but filters the fake's documents to those whose (int32)
+// _id is strictly greater than the resume boundary encoded in lastID, matching
+// the {_id: {$gt: lastID}} semantics of the real adapter.
+func (s *fakeSrcColl) findFrom(ctx context.Context, batch int, lastID []byte) (docCursor, error) {
+	s.gate.arrive(ctx)
+	if s.findErr != nil {
+		return nil, s.findErr
+	}
+	docs := s.docs
+	if len(lastID) > 0 {
+		boundary, ok := idFromBytes(lastID)
+		if !ok {
+			return nil, errors.New("fake findFrom: undecodable resume boundary")
+		}
+		filtered := make([]bson.Raw, 0, len(s.docs))
+		for _, d := range s.docs {
+			if id, ok := docIntID(d); ok && id > boundary {
+				filtered = append(filtered, d)
+			}
+		}
+		docs = filtered
+	}
+	cur := &fakeCursor{
+		docs:        docs,
+		decodeErrAt: s.decodeErr,
+		respectCtx:  s.respectCtx,
+		cancel:      s.cancel,
+		cancelAt:    s.cancelAt,
+	}
+	s.mu.Lock()
+	s.lastCursor = cur
+	s.findBatch = batch
+	s.findFromLast = append([]byte(nil), lastID...)
+	s.findFromCall = true
+	s.mu.Unlock()
+	return cur, nil
+}
+
 func (s *fakeSrcColl) listIndexes(context.Context) ([]bson.Raw, error) {
 	if s.indexErr != nil {
 		return nil, s.indexErr
@@ -143,10 +183,15 @@ type fakeDstColl struct {
 	createErr error
 	createN   int // returned index count; 0 => len(models)
 	writeFn   func(docs []bson.Raw) (inserted, dupes, failed int, err error)
+	upsertFn  func(docs []bson.Raw) (written, failed int, err error)
+	// upsertStore, when non-nil, makes writeBatchUpsert idempotent: docs are keyed
+	// by their (int32) _id so re-copying an overlapping batch does not duplicate.
+	upsertStore map[int32]bson.Raw
 
 	mu            sync.Mutex
 	dropped       bool
 	batches       [][]bson.Raw
+	upsertBatches [][]bson.Raw
 	createdModels []mongo.IndexModel
 }
 
@@ -177,6 +222,34 @@ func (d *fakeDstColl) writeBatch(ctx context.Context, docs []bson.Raw) (int, int
 		return d.writeFn(cp)
 	}
 	return len(docs), 0, 0, nil
+}
+
+func (d *fakeDstColl) writeBatchUpsert(ctx context.Context, docs []bson.Raw) (int, int, error) {
+	cp := make([]bson.Raw, len(docs))
+	copy(cp, docs)
+	d.mu.Lock()
+	d.upsertBatches = append(d.upsertBatches, cp)
+	if d.upsertStore != nil {
+		for _, doc := range cp {
+			if id, ok := docIntID(doc); ok {
+				d.upsertStore[id] = doc
+			}
+		}
+	}
+	d.mu.Unlock()
+	if d.upsertFn != nil {
+		return d.upsertFn(cp)
+	}
+	return len(docs), 0, nil
+}
+
+// allUpsertBatches returns a copy of the recorded upsert batches for assertion.
+func (d *fakeDstColl) allUpsertBatches() [][]bson.Raw {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([][]bson.Raw, len(d.upsertBatches))
+	copy(out, d.upsertBatches)
+	return out
 }
 
 func (d *fakeDstColl) createIndexes(ctx context.Context, models []mongo.IndexModel) (int, error) {
@@ -278,6 +351,17 @@ func (r *recordReporter) progressCalls() []progressCall {
 
 func ns(db, coll string) namespace.Namespace { return namespace.Namespace{DB: db, Collection: coll} }
 
+// docIntID reads the int32 _id of a test document.
+func docIntID(d bson.Raw) (int32, bool) {
+	return d.Lookup("_id").Int32OK()
+}
+
+// idFromBytes reads the int32 _id out of the {"_id": value} boundary encoding
+// produced by extractID (the format the copier hands to OnProgress / ResumeFrom).
+func idFromBytes(b []byte) (int32, bool) {
+	return bson.Raw(b).Lookup("_id").Int32OK()
+}
+
 func doc(t *testing.T, id int) bson.Raw {
 	t.Helper()
 	return mustRaw(t, bson.D{{Key: "_id", Value: int32(id)}, {Key: "n", Value: int32(id * 10)}})
@@ -310,6 +394,51 @@ func intsEqual(a, b []int) bool {
 		}
 	}
 	return true
+}
+
+// mustExtractID returns the resume-boundary encoding of a document's _id or fails
+// the test. It is the same encoding the copier hands to OnProgress and reads back
+// from ResumeFrom.
+func mustExtractID(t *testing.T, d bson.Raw) []byte {
+	t.Helper()
+	b, err := extractID(d)
+	if err != nil {
+		t.Fatalf("extractID: %v", err)
+	}
+	return b
+}
+
+// progressRec captures OnProgress callbacks. It is safe for concurrent use since
+// the copier may invoke OnProgress from worker goroutines.
+type progressRec struct {
+	mu    sync.Mutex
+	calls []onProgressCall
+}
+
+type onProgressCall struct {
+	ns         namespace.Namespace
+	lastID     []byte
+	docsCopied int64
+	done       bool
+}
+
+func (p *progressRec) fn(ns namespace.Namespace, lastID []byte, docsCopied int64, done bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, onProgressCall{
+		ns:         ns,
+		lastID:     append([]byte(nil), lastID...),
+		docsCopied: docsCopied,
+		done:       done,
+	})
+}
+
+func (p *progressRec) snapshot() []onProgressCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]onProgressCall, len(p.calls))
+	copy(out, p.calls)
+	return out
 }
 
 // -----------------------------------------------------------------------------
@@ -757,6 +886,9 @@ func (s *erroringCursorSrc) listIndexes(context.Context) ([]bson.Raw, error) {
 func (s *erroringCursorSrc) find(context.Context, int) (docCursor, error) {
 	return &erroringCursor{docs: s.docs}, nil
 }
+func (s *erroringCursorSrc) findFrom(context.Context, int, []byte) (docCursor, error) {
+	return &erroringCursor{docs: s.docs}, nil
+}
 
 type erroringCursor struct {
 	docs []bson.Raw
@@ -1073,5 +1205,302 @@ func TestNew_SmokeConstructsCopier(t *testing.T) {
 	}
 	if c.reporter == nil || c.log == nil || c.factory == nil {
 		t.Errorf("New left a dependency unset: %+v", c)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Resume / resilience tests
+// -----------------------------------------------------------------------------
+
+// TestCopy_SkipNamespacesSkipsEntirely verifies a namespace already complete on a
+// prior run is skipped: marked Skipped, no source cursor opened, no writes, and
+// OnProgress is not re-invoked.
+func TestCopy_SkipNamespacesSkipsEntirely(t *testing.T) {
+	f := newFakeFactory()
+	n1 := ns("shop", "orders")
+	src := &fakeSrcColl{docs: makeDocs(t, 5), decodeErr: -1}
+	dst := &fakeDstColl{}
+	f.add(n1, src, dst)
+
+	rec := &progressRec{}
+	c := newWithFactory(f, engine.NopReporter{}, nil)
+	res, err := c.Copy(context.Background(), engine.CopyOptions{
+		Namespaces:     []namespace.Namespace{n1},
+		Workers:        1,
+		BatchSize:      2,
+		SkipNamespaces: map[string]bool{n1.String(): true},
+		OnProgress:     rec.fn,
+	})
+	if err != nil {
+		t.Fatalf("Copy error: %v", err)
+	}
+	if !res.Collections[0].Skipped {
+		t.Errorf("expected collection to be marked Skipped")
+	}
+	if res.Collections[0].Err != "" {
+		t.Errorf("skipped namespace should have no Err, got %q", res.Collections[0].Err)
+	}
+	if res.TotalDocs != 0 {
+		t.Errorf("skipped namespace should copy nothing, TotalDocs=%d", res.TotalDocs)
+	}
+	if len(dst.allBatches()) != 0 || len(dst.allUpsertBatches()) != 0 {
+		t.Errorf("skipped namespace must not write any batch")
+	}
+	src.mu.Lock()
+	opened := src.lastCursor != nil || src.findFromCall
+	src.mu.Unlock()
+	if opened {
+		t.Errorf("skipped namespace must not open a source cursor")
+	}
+	if calls := rec.snapshot(); len(calls) != 0 {
+		t.Errorf("OnProgress must not be called for a skipped namespace, got %d calls", len(calls))
+	}
+}
+
+// TestCopy_ResumeFromFiltersAndUpserts verifies a resumed namespace reads from
+// {_id: {$gt: lastID}} via findFrom and writes through the idempotent upsert path
+// (never the InsertMany path).
+func TestCopy_ResumeFromFiltersAndUpserts(t *testing.T) {
+	f := newFakeFactory()
+	n1 := ns("db", "c")
+	src := &fakeSrcColl{docs: makeDocs(t, 6), decodeErr: -1} // _ids 0..5
+	dst := &fakeDstColl{}
+	f.add(n1, src, dst)
+
+	boundary := mustExtractID(t, doc(t, 2)) // resume after _id=2
+
+	c := newWithFactory(f, engine.NopReporter{}, nil)
+	res, err := c.Copy(context.Background(), engine.CopyOptions{
+		Namespaces: []namespace.Namespace{n1},
+		Workers:    1,
+		BatchSize:  2,
+		ResumeFrom: map[string][]byte{n1.String(): boundary},
+	})
+	if err != nil {
+		t.Fatalf("Copy error: %v", err)
+	}
+	if res.TotalDocs != 3 {
+		t.Errorf("TotalDocs=%d, want 3 (only _id>2)", res.TotalDocs)
+	}
+
+	src.mu.Lock()
+	fromCall, fromLast := src.findFromCall, src.findFromLast
+	src.mu.Unlock()
+	if !fromCall {
+		t.Fatalf("resume must open the cursor via findFrom, not find")
+	}
+	if !bytes.Equal(fromLast, boundary) {
+		t.Errorf("findFrom boundary = %x, want %x", fromLast, boundary)
+	}
+
+	if len(dst.allBatches()) != 0 {
+		t.Errorf("resume must not use the InsertMany writeBatch path")
+	}
+	ub := dst.allUpsertBatches()
+	if got := batchLens(ub); !intsEqual(got, []int{2, 1}) {
+		t.Errorf("upsert batch sizes = %v, want [2 1]", got)
+	}
+	var gotIDs []int32
+	for _, b := range ub {
+		for _, d := range b {
+			id, _ := docIntID(d)
+			gotIDs = append(gotIDs, id)
+		}
+	}
+	want := []int32{3, 4, 5}
+	if len(gotIDs) != len(want) {
+		t.Fatalf("copied ids = %v, want %v", gotIDs, want)
+	}
+	for i := range want {
+		if gotIDs[i] != want[i] {
+			t.Errorf("copied id[%d]=%d, want %d", i, gotIDs[i], want[i])
+		}
+	}
+}
+
+// TestCopy_ResumeUpsertIsIdempotent proves re-copying the boundary batch is safe:
+// against a destination pre-seeded with docs that overlap the resume range, and
+// across two resume runs, the upsert path never duplicates.
+func TestCopy_ResumeUpsertIsIdempotent(t *testing.T) {
+	f := newFakeFactory()
+	n1 := ns("db", "c")
+	src := &fakeSrcColl{docs: makeDocs(t, 6), decodeErr: -1} // _ids 0..5
+	// A crash left docs 3 and 4 already written even though the checkpoint only
+	// recorded _id=2; re-copying that overlap must not duplicate.
+	dst := &fakeDstColl{upsertStore: map[int32]bson.Raw{
+		3: doc(t, 3),
+		4: doc(t, 4),
+	}}
+	f.add(n1, src, dst)
+
+	boundary := mustExtractID(t, doc(t, 2))
+	opts := engine.CopyOptions{
+		Namespaces: []namespace.Namespace{n1},
+		Workers:    1,
+		BatchSize:  2,
+		ResumeFrom: map[string][]byte{n1.String(): boundary},
+	}
+	c := newWithFactory(f, engine.NopReporter{}, nil)
+	if _, err := c.Copy(context.Background(), opts); err != nil {
+		t.Fatalf("Copy error: %v", err)
+	}
+	// A second resume of the same boundary must remain idempotent.
+	if _, err := c.Copy(context.Background(), opts); err != nil {
+		t.Fatalf("second Copy error: %v", err)
+	}
+
+	dst.mu.Lock()
+	n := len(dst.upsertStore)
+	_, has3 := dst.upsertStore[3]
+	_, has4 := dst.upsertStore[4]
+	_, has5 := dst.upsertStore[5]
+	dst.mu.Unlock()
+	if n != 3 {
+		t.Errorf("destination holds %d docs, want 3 (idempotent upsert over the overlap)", n)
+	}
+	if !has3 || !has4 || !has5 {
+		t.Errorf("destination must hold exactly _id 3,4,5 after resume")
+	}
+}
+
+// TestCopy_OnProgressPerBatchAndCompletion verifies OnProgress fires once per
+// written batch with the batch's last _id and running count (done=false), then a
+// final time at completion (done=true).
+func TestCopy_OnProgressPerBatchAndCompletion(t *testing.T) {
+	f := newFakeFactory()
+	n1 := ns("db", "c")
+	src := &fakeSrcColl{docs: makeDocs(t, 5), decodeErr: -1} // _ids 0..4
+	dst := &fakeDstColl{}
+	f.add(n1, src, dst)
+
+	rec := &progressRec{}
+	c := newWithFactory(f, engine.NopReporter{}, nil)
+	if _, err := c.Copy(context.Background(), engine.CopyOptions{
+		Namespaces: []namespace.Namespace{n1},
+		Workers:    1,
+		BatchSize:  2,
+		OnProgress: rec.fn,
+	}); err != nil {
+		t.Fatalf("Copy error: %v", err)
+	}
+
+	calls := rec.snapshot()
+	// Batches [0,1],[2,3],[4] -> three done=false callbacks, then one done=true.
+	if len(calls) != 4 {
+		t.Fatalf("OnProgress called %d times, want 4: %+v", len(calls), calls)
+	}
+	wants := []struct {
+		lastID     int32
+		docsCopied int64
+		done       bool
+	}{
+		{1, 2, false},
+		{3, 4, false},
+		{4, 5, false},
+		{4, 5, true},
+	}
+	for i, w := range wants {
+		got := calls[i]
+		if got.ns != n1 {
+			t.Errorf("call[%d].ns=%v, want %v", i, got.ns, n1)
+		}
+		id, ok := idFromBytes(got.lastID)
+		if !ok {
+			t.Fatalf("call[%d] lastID not decodable: %x", i, got.lastID)
+		}
+		if id != w.lastID || got.docsCopied != w.docsCopied || got.done != w.done {
+			t.Errorf("call[%d]=(id=%d docs=%d done=%v), want (id=%d docs=%d done=%v)",
+				i, id, got.docsCopied, got.done, w.lastID, w.docsCopied, w.done)
+		}
+	}
+}
+
+// TestCopy_FreshCopyUsesInsertPathNotResume guards that a plain copy (no
+// SkipNamespaces / ResumeFrom) is unchanged: it reads via find and writes via the
+// InsertMany writeBatch path, never touching the resume paths.
+func TestCopy_FreshCopyUsesInsertPathNotResume(t *testing.T) {
+	f := newFakeFactory()
+	n1 := ns("db", "c")
+	src := &fakeSrcColl{docs: makeDocs(t, 5), decodeErr: -1}
+	dst := &fakeDstColl{}
+	f.add(n1, src, dst)
+
+	c := newWithFactory(f, engine.NopReporter{}, nil)
+	res, err := c.Copy(context.Background(), engine.CopyOptions{
+		Namespaces: []namespace.Namespace{n1},
+		Workers:    1,
+		BatchSize:  2,
+	})
+	if err != nil {
+		t.Fatalf("Copy error: %v", err)
+	}
+	if res.TotalDocs != 5 {
+		t.Errorf("TotalDocs=%d, want 5", res.TotalDocs)
+	}
+	src.mu.Lock()
+	fromCall := src.findFromCall
+	src.mu.Unlock()
+	if fromCall {
+		t.Errorf("fresh copy must not use findFrom")
+	}
+	if len(dst.allUpsertBatches()) != 0 {
+		t.Errorf("fresh copy must not use the upsert path")
+	}
+	if got := batchLens(dst.allBatches()); !intsEqual(got, []int{2, 2, 1}) {
+		t.Errorf("fresh copy batch sizes = %v, want [2 2 1]", got)
+	}
+}
+
+// TestExtractID_RoundTripsAllTypes verifies the resume-boundary encoding preserves
+// the _id's BSON type and bytes across the id shapes a real deployment uses.
+func TestExtractID_RoundTripsAllTypes(t *testing.T) {
+	oid := bson.NewObjectID()
+	cases := []struct {
+		name string
+		id   any
+	}{
+		{"int32", int32(7)},
+		{"int64", int64(1) << 40},
+		{"string", "customer-42"},
+		{"objectID", oid},
+		{"compound", bson.D{{Key: "a", Value: int32(1)}, {Key: "b", Value: "x"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := mustRaw(t, bson.D{{Key: "_id", Value: tc.id}, {Key: "n", Value: int32(1)}})
+			got, err := extractID(raw)
+			if err != nil {
+				t.Fatalf("extractID error: %v", err)
+			}
+			orig := raw.Lookup("_id")
+			rebuilt := bson.Raw(got).Lookup("_id")
+			if rebuilt.Type != orig.Type {
+				t.Errorf("type = %v, want %v", rebuilt.Type, orig.Type)
+			}
+			if !bytes.Equal(rebuilt.Value, orig.Value) {
+				t.Errorf("value bytes mismatch for %s", tc.name)
+			}
+		})
+	}
+}
+
+// TestExtractID_MissingIDErrors verifies a document without _id is rejected rather
+// than silently producing a bogus boundary.
+func TestExtractID_MissingIDErrors(t *testing.T) {
+	raw := mustRaw(t, bson.D{{Key: "x", Value: int32(1)}})
+	if _, err := extractID(raw); err == nil {
+		t.Fatalf("expected an error for a document without _id")
+	}
+}
+
+// TestExtractID_StableForSameID verifies the boundary depends only on _id, not on
+// the rest of the document.
+func TestExtractID_StableForSameID(t *testing.T) {
+	a := mustRaw(t, bson.D{{Key: "_id", Value: int32(5)}, {Key: "n", Value: int32(1)}})
+	b := mustRaw(t, bson.D{{Key: "_id", Value: int32(5)}, {Key: "n", Value: int32(999)}})
+	ga := mustExtractID(t, a)
+	gb := mustExtractID(t, b)
+	if !bytes.Equal(ga, gb) {
+		t.Errorf("extractID not stable for equal _id: %x vs %x", ga, gb)
 	}
 }
