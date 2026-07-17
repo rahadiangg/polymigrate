@@ -1,0 +1,77 @@
+# GoReleaser configuration for polymigrate.
+# Docs: https://goreleaser.com
+version: 2
+
+project_name: polymigrate
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: poly
+    main: ./cmd/poly
+    binary: poly
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/rahadiangg/polymigrate/internal/cli.Version={{ .Version }}
+      - -X github.com/rahadiangg/polymigrate/internal/cli.Commit={{ .ShortCommit }}
+      - -X github.com/rahadiangg/polymigrate/internal/cli.BuildDate={{ .Date }}
+
+archives:
+  # Naming must stay in sync with install.sh:
+  #   polymigrate_<os>_<arch>.tar.gz   (.zip on windows)
+  - id: default
+    ids:
+      - poly
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge branch"
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Others
+      order: 999
+
+release:
+  github:
+    owner: rahadiangg
+    name: polymigrate
+  draft: false
+  prerelease: auto
+  name_template: "v{{ .Version }}"

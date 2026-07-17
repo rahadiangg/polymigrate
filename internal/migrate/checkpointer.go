@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/weefer/mongomigrate/internal/checkpoint"
-	"github.com/weefer/mongomigrate/internal/engine"
-	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/checkpoint"
+	"github.com/rahadiangg/polymigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
 )
 
 // checkpointer serializes and throttles writes to a checkpoint.Store. Its update

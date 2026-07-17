@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
 )
 
 func TestValidate(t *testing.T) {

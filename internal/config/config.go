@@ -12,7 +12,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
 )
 
 // Mode selects what a migration run does.

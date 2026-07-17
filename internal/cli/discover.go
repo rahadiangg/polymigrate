@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/weefer/mongomigrate/internal/mongox"
+	"github.com/rahadiangg/polymigrate/internal/mongox"
 )
 
 func newDiscoverCmd() *cobra.Command {

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/weefer/mongomigrate/internal/config"
+	"github.com/rahadiangg/polymigrate/internal/config"
 )
 
 func TestRootHasSubcommands(t *testing.T) {
@@ -32,7 +32,7 @@ func TestVersionOutput(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	if !bytes.Contains(buf.Bytes(), []byte("mm ")) {
+	if !bytes.Contains(buf.Bytes(), []byte("poly ")) {
 		t.Errorf("version output = %q", buf.String())
 	}
 }

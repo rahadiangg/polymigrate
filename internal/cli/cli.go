@@ -1,4 +1,4 @@
-// Package cli wires the mm command tree. main() calls Execute; commands are
+// Package cli wires the poly command tree. main() calls Execute; commands are
 // defined here so they can be constructed and exercised in tests. Subcommands
 // for migrate/verify/tail are registered by their own files in this package.
 package cli
@@ -36,9 +36,9 @@ func Execute() int {
 // NewRootCmd builds the root command with all subcommands attached.
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "mm",
-		Short: "mongomigrate — migrate MongoDB across flavors and topologies",
-		Long: "mm migrates data between any MongoDB-compatible deployments\n" +
+		Use:   "poly",
+		Short: "polymigrate — migrate MongoDB across flavors and topologies",
+		Long: "poly migrates data between any MongoDB-compatible deployments\n" +
 			"(standalone, replica set, sharded, Atlas, Huawei DDS, Percona) in any\n" +
 			"direction, with a native parallel copier, change-stream CDC for\n" +
 			"near-zero-downtime cutover, and a verifier that proves correctness.",
@@ -65,7 +65,7 @@ func newVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print version information",
 		Run: func(cmd *cobra.Command, _ []string) {
-			fmt.Fprintf(cmd.OutOrStdout(), "mm %s (commit %s, built %s)\n", Version, Commit, BuildDate)
+			fmt.Fprintf(cmd.OutOrStdout(), "poly %s (commit %s, built %s)\n", Version, Commit, BuildDate)
 		},
 	}
 }

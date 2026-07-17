@@ -11,10 +11,10 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/weefer/mongomigrate/internal/engine"
-	"github.com/weefer/mongomigrate/internal/mongox"
-	"github.com/weefer/mongomigrate/internal/namespace"
-	"github.com/weefer/mongomigrate/internal/progress"
+	"github.com/rahadiangg/polymigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/mongox"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/progress"
 )
 
 // scriptItem is one step in a fakeSource script: either an event or an error.

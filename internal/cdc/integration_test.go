@@ -17,9 +17,9 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/weefer/mongomigrate/internal/engine"
-	"github.com/weefer/mongomigrate/internal/mongox"
-	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/mongox"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
 )
 
 func TestIntegration_TailInsertUpdateDelete(t *testing.T) {

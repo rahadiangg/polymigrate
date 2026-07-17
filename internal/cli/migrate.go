@@ -9,13 +9,13 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/weefer/mongomigrate/internal/cdc"
-	"github.com/weefer/mongomigrate/internal/checkpoint"
-	"github.com/weefer/mongomigrate/internal/config"
-	"github.com/weefer/mongomigrate/internal/copier"
-	"github.com/weefer/mongomigrate/internal/engine"
-	"github.com/weefer/mongomigrate/internal/migrate"
-	"github.com/weefer/mongomigrate/internal/verify"
+	"github.com/rahadiangg/polymigrate/internal/cdc"
+	"github.com/rahadiangg/polymigrate/internal/checkpoint"
+	"github.com/rahadiangg/polymigrate/internal/config"
+	"github.com/rahadiangg/polymigrate/internal/copier"
+	"github.com/rahadiangg/polymigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/migrate"
+	"github.com/rahadiangg/polymigrate/internal/verify"
 )
 
 func init() {
@@ -78,6 +78,9 @@ func newMigrateCmd() *cobra.Command {
 			live := cfg.Mode == config.ModeLive
 			if live && !eps.src.Info.SupportsChangeStreams {
 				return fmt.Errorf("source %s does not support change streams (need a replica set or sharded cluster on 3.6+); use --mode snapshot", eps.src.Info.String())
+			}
+			if live && eps.src.Info.LiveCDCDriverBug() {
+				return fmt.Errorf("source %s: live CDC from a Huawei DDS sharded cluster hits a known MongoDB driver change-stream crash; migrate from a DDS replica set, or use --mode snapshot (with a brief write freeze at cutover)", eps.src.Info.String())
 			}
 
 			nss, err := resolveNamespaces(ctx, eps.src, cfg, log)

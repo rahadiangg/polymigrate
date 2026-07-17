@@ -8,11 +8,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/weefer/mongomigrate/internal/config"
-	"github.com/weefer/mongomigrate/internal/logx"
-	"github.com/weefer/mongomigrate/internal/mongox"
-	"github.com/weefer/mongomigrate/internal/namespace"
-	"github.com/weefer/mongomigrate/internal/progress"
+	"github.com/rahadiangg/polymigrate/internal/config"
+	"github.com/rahadiangg/polymigrate/internal/logx"
+	"github.com/rahadiangg/polymigrate/internal/mongox"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/progress"
 )
 
 // commonFlags are shared by migrate, verify, and tail: how to connect and which

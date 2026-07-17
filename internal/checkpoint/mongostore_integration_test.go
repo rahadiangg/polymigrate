@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/weefer/mongomigrate/internal/mongox"
+	"github.com/rahadiangg/polymigrate/internal/mongox"
 )
 
 func TestIntegration_MongoStoreRoundTrip(t *testing.T) {
@@ -32,7 +32,7 @@ func TestIntegration_MongoStoreRoundTrip(t *testing.T) {
 	defer cl.Close(context.Background())
 
 	// Use a throwaway db/coll so the test is self-contained.
-	store := NewMongoStore(cl, "_mongomigrate_it", "checkpoints")
+	store := NewMongoStore(cl, "_polymigrate_it", "checkpoints")
 	runID := "it-run-1"
 	t.Cleanup(func() { _ = store.Delete(context.Background(), runID) })
 

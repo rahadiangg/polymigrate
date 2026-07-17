@@ -1,4 +1,4 @@
-module github.com/weefer/mongomigrate
+module github.com/rahadiangg/polymigrate
 
 go 1.26.5
 

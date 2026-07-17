@@ -1,9 +1,12 @@
 # Binaries
-/mm
+/poly
 /bin/
 *.exe
 *.test
 *.out
+
+# GoReleaser build output
+/dist/
 
 # Coverage
 coverage.txt
@@ -14,4 +17,10 @@ coverage.html
 *.local.yaml
 
 # Checkpoint mirror
-.mm-checkpoints/
+.poly-checkpoints/
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/

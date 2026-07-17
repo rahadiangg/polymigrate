@@ -16,19 +16,19 @@ SRC_RS=rs0
 DST_RS=rs1
 
 teardown() {
-  docker rm -f mm-src mm-dst >/dev/null 2>&1
+  docker rm -f poly-src poly-dst >/dev/null 2>&1
 }
 
 up() {
   teardown
   echo ">> pulling $IMG (if needed) and starting containers"
-  docker run -d --name mm-src -p ${SRC_PORT}:${SRC_PORT} "$IMG" \
+  docker run -d --name poly-src -p ${SRC_PORT}:${SRC_PORT} "$IMG" \
     mongod --replSet $SRC_RS --port ${SRC_PORT} --bind_ip_all >/dev/null
-  docker run -d --name mm-dst -p ${DST_PORT}:${DST_PORT} "$IMG" \
+  docker run -d --name poly-dst -p ${DST_PORT}:${DST_PORT} "$IMG" \
     mongod --replSet $DST_RS --port ${DST_PORT} --bind_ip_all >/dev/null
 
   echo ">> waiting for mongod to accept connections"
-  for c in "mm-src ${SRC_PORT}" "mm-dst ${DST_PORT}"; do
+  for c in "poly-src ${SRC_PORT}" "poly-dst ${DST_PORT}"; do
     set -- $c
     for i in $(seq 1 60); do
       if docker exec $1 mongosh --quiet --port $2 --eval 'db.runCommand({ping:1}).ok' 2>/dev/null | grep -q 1; then
@@ -40,13 +40,13 @@ up() {
   done
 
   echo ">> initiating replica sets"
-  docker exec mm-src mongosh --quiet --port ${SRC_PORT} --eval \
+  docker exec poly-src mongosh --quiet --port ${SRC_PORT} --eval \
     "rs.initiate({_id:'${SRC_RS}',members:[{_id:0,host:'localhost:${SRC_PORT}'}]})" >/dev/null
-  docker exec mm-dst mongosh --quiet --port ${DST_PORT} --eval \
+  docker exec poly-dst mongosh --quiet --port ${DST_PORT} --eval \
     "rs.initiate({_id:'${DST_RS}',members:[{_id:0,host:'localhost:${DST_PORT}'}]})" >/dev/null
 
   echo ">> waiting for primaries"
-  for c in "mm-src ${SRC_PORT}" "mm-dst ${DST_PORT}"; do
+  for c in "poly-src ${SRC_PORT}" "poly-dst ${DST_PORT}"; do
     set -- $c
     for i in $(seq 1 60); do
       if docker exec $1 mongosh --quiet --port $2 --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true; then
@@ -60,7 +60,7 @@ up() {
 
 seed() {
   echo ">> seeding source (shop.orders, shop.users with indexes; analytics.events)"
-  docker exec mm-src mongosh --quiet --port ${SRC_PORT} --eval '
+  docker exec poly-src mongosh --quiet --port ${SRC_PORT} --eval '
     const d = db.getSiblingDB("shop");
     d.orders.drop(); d.users.drop();
     const orders = [];
@@ -84,7 +84,7 @@ seed() {
 # Generate live writes on the source (for CDC testing). Arg: number of ops.
 writes() {
   local n="${1:-500}"
-  docker exec mm-src mongosh --quiet --port ${SRC_PORT} --eval "
+  docker exec poly-src mongosh --quiet --port ${SRC_PORT} --eval "
     const d = db.getSiblingDB('shop');
     for (let i=0;i<${n};i++) {
       const id = 100000+i;
@@ -100,23 +100,23 @@ writes() {
 
 wait_dst_primary() {
   for i in $(seq 1 60); do
-    if docker exec mm-dst mongosh --quiet --port ${DST_PORT} --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true; then
-      echo "   mm-dst primary"; return 0
+    if docker exec poly-dst mongosh --quiet --port ${DST_PORT} --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true; then
+      echo "   poly-dst primary"; return 0
     fi
     sleep 1
   done
-  echo "   mm-dst no primary"; return 1
+  echo "   poly-dst no primary"; return 1
 }
 
 # Pause the destination process (SIGSTOP) — simulates a transient outage that
 # retry/backoff should ride out. Pair with unpause-dst.
-pause_dst()   { docker pause mm-dst   >/dev/null && echo "mm-dst paused"; }
-unpause_dst() { docker unpause mm-dst >/dev/null && echo "mm-dst unpaused"; }
+pause_dst()   { docker pause poly-dst   >/dev/null && echo "poly-dst paused"; }
+unpause_dst() { docker unpause poly-dst >/dev/null && echo "poly-dst unpaused"; }
 
 # Hard-stop the destination container — simulates the destination dying.
-kill_dst()    { docker stop -t 0 mm-dst >/dev/null && echo "mm-dst stopped"; }
+kill_dst()    { docker stop -t 0 poly-dst >/dev/null && echo "poly-dst stopped"; }
 # Bring the destination back and wait for its primary.
-restart_dst() { docker start mm-dst >/dev/null && echo "mm-dst started" && wait_dst_primary; }
+restart_dst() { docker start poly-dst >/dev/null && echo "poly-dst started" && wait_dst_primary; }
 
 case "${1:-up}" in
   up) up && seed ;;

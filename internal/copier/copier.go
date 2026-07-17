@@ -21,9 +21,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/weefer/mongomigrate/internal/engine"
-	"github.com/weefer/mongomigrate/internal/mongox"
-	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/mongox"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
 )
 
 // defaultBatchSize is used when CopyOptions.BatchSize is not a positive number.

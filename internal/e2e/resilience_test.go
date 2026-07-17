@@ -6,7 +6,7 @@
 //   - a transient destination outage is ridden out by retry/backoff;
 //   - a CDC stream resumes from its checkpointed token after a simulated crash.
 //
-// Run: MM_SRC_URI=... MM_DST_URI=... go test -tags=integration ./internal/e2e/...
+// Run: POLY_SRC_URI=... POLY_DST_URI=... go test -tags=integration ./internal/e2e/...
 package e2e
 
 import (
@@ -19,16 +19,16 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/weefer/mongomigrate/internal/cdc"
-	"github.com/weefer/mongomigrate/internal/checkpoint"
-	"github.com/weefer/mongomigrate/internal/copier"
-	"github.com/weefer/mongomigrate/internal/engine"
-	"github.com/weefer/mongomigrate/internal/logx"
-	"github.com/weefer/mongomigrate/internal/migrate"
-	"github.com/weefer/mongomigrate/internal/mongox"
-	"github.com/weefer/mongomigrate/internal/namespace"
-	"github.com/weefer/mongomigrate/internal/progress"
-	"github.com/weefer/mongomigrate/internal/verify"
+	"github.com/rahadiangg/polymigrate/internal/cdc"
+	"github.com/rahadiangg/polymigrate/internal/checkpoint"
+	"github.com/rahadiangg/polymigrate/internal/copier"
+	"github.com/rahadiangg/polymigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/logx"
+	"github.com/rahadiangg/polymigrate/internal/migrate"
+	"github.com/rahadiangg/polymigrate/internal/mongox"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/progress"
+	"github.com/rahadiangg/polymigrate/internal/verify"
 )
 
 func docker(t *testing.T, args ...string) {
@@ -184,14 +184,14 @@ func TestTransientOutageRetry(t *testing.T) {
 	// backoff (or the driver riding out the stall) must let the copy complete.
 	// DropTarget is off because the destination is already empty and drop is not
 	// on the retry path.
-	docker(t, "pause", "mm-dst")
+	docker(t, "pause", "poly-dst")
 	unpaused := make(chan struct{})
 	go func() {
 		time.Sleep(4 * time.Second)
-		docker(t, "unpause", "mm-dst")
+		docker(t, "unpause", "poly-dst")
 		close(unpaused)
 	}()
-	t.Cleanup(func() { _ = exec.Command("docker", "unpause", "mm-dst").Run() })
+	t.Cleanup(func() { _ = exec.Command("docker", "unpause", "poly-dst").Run() })
 
 	rep, err := newEng(src, dst).Run(bg, migrate.Options{
 		Copy:      engine.CopyOptions{Namespaces: nss, Workers: 2, BatchSize: 200, DropTarget: false, CopyIndexes: true},
@@ -246,7 +246,7 @@ func TestCDCResumeFromToken(t *testing.T) {
 	coll := src.Database("res").Collection("aaa")
 	writeWave(t, bg, coll, 0, 300)
 	// Wait until a token has been checkpointed and the first wave applied.
-	waitFor(t, 20*time.Second, func() bool { return len(lastToken) > 0 && tl1.Stats().Applied >= 300 && tl1.Stats().Buffered == 0 })
+	waitFor(t, cdcTimeout(20*time.Second), func() bool { return len(lastToken) > 0 && tl1.Stats().Applied >= 300 && tl1.Stats().Buffered == 0 })
 
 	// Simulate a crash: stop applying and abandon the tailer WITHOUT draining.
 	tl1.Stop()
@@ -264,7 +264,7 @@ func TestCDCResumeFromToken(t *testing.T) {
 	}
 	applyDone2 := make(chan error, 1)
 	go func() { applyDone2 <- tl2.Apply(bg) }()
-	waitFor(t, 30*time.Second, func() bool { return tl2.Stats().Buffered == 0 && tl2.Stats().Applied >= 300 })
+	waitFor(t, cdcTimeout(30*time.Second), func() bool { return tl2.Stats().Buffered == 0 && tl2.Stats().Applied >= 300 })
 	tl2.Stop()
 	<-applyDone2
 	_ = tl2.Close(bg)

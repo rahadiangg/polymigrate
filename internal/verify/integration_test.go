@@ -15,9 +15,9 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/weefer/mongomigrate/internal/engine"
-	"github.com/weefer/mongomigrate/internal/mongox"
-	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/mongox"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
 )
 
 func integrationClients(t *testing.T) (*mongox.Client, *mongox.Client) {
@@ -46,7 +46,7 @@ func TestIntegration_VerifyMatching(t *testing.T) {
 	defer src.Close(ctx)
 	defer dst.Close(ctx)
 
-	ns := namespace.Namespace{DB: "mongomigrate_verify_it", Collection: "docs"}
+	ns := namespace.Namespace{DB: "polymigrate_verify_it", Collection: "docs"}
 	seed := func(c *mongox.Client) {
 		coll := c.Database(ns.DB).Collection(ns.Collection)
 		_ = c.Database(ns.DB).Drop(ctx)

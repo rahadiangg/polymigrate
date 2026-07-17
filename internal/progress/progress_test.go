@@ -7,8 +7,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/weefer/mongomigrate/internal/engine"
-	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
 )
 
 func TestLogReporterThrottlesProgress(t *testing.T) {

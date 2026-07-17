@@ -12,7 +12,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
 )
 
 // ErrChangeStreamHistoryLost signals that the source oplog no longer retains the

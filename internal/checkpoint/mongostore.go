@@ -10,13 +10,13 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/weefer/mongomigrate/internal/mongox"
+	"github.com/rahadiangg/polymigrate/internal/mongox"
 )
 
 // Default database and collection names for the checkpoint store. The store
 // lives on the destination, co-located with the data it protects.
 const (
-	DefaultDB   = "_mongomigrate"
+	DefaultDB   = "_polymigrate"
 	DefaultColl = "checkpoints"
 )
 

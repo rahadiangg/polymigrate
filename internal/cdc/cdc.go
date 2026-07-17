@@ -29,9 +29,9 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/weefer/mongomigrate/internal/engine"
-	"github.com/weefer/mongomigrate/internal/mongox"
-	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/mongox"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
 )
 
 // Defaults applied when TailOptions leaves a sizing field at its zero value.
@@ -253,6 +253,20 @@ func (t *Tailer) Open(ctx context.Context, opts engine.TailOptions) error {
 func (t *Tailer) readLoop() {
 	defer close(t.readerDone)
 	defer close(t.buffer)
+	// Safety net: the mongo-driver's change-stream reader can panic (a nil-pointer
+	// deref in ChangeStream.loopNext) against a sharded cluster's mongos — observed
+	// with Huawei DDS cluster sources a few seconds after events start flowing.
+	// Registered last so it runs first on unwind: convert the crash into a clean,
+	// actionable read error (and still close the buffer/readerDone below) instead of
+	// taking down the whole process. See README "Known issue". Pre-flight,
+	// ServerInfo.LiveCDCDriverBug already refuses this when the source is detected as
+	// a DDS cluster; this catches the case where the flavor wasn't identified (e.g.
+	// connecting via a bare EIP reports flavor=mongodb).
+	defer func() {
+		if r := recover(); r != nil {
+			t.setReadErr(fmt.Errorf("cdc: change stream read: MongoDB driver panicked reading the source change stream — a sharded cluster / mongos source (e.g. Huawei DDS) can crash the driver; use --mode snapshot, or run CDC from a replica set: %v", r))
+		}
+	}()
 
 	for {
 		ev, ok, err := t.source.Next(t.streamCtx)

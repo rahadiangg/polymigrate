@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/weefer/mongomigrate/internal/checkpoint"
-	"github.com/weefer/mongomigrate/internal/engine"
-	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/checkpoint"
+	"github.com/rahadiangg/polymigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
 )
 
 // TestVerifyMismatchFails_Snapshot covers the review fix: a verifier that runs

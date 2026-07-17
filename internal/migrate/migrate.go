@@ -25,9 +25,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/weefer/mongomigrate/internal/checkpoint"
-	"github.com/weefer/mongomigrate/internal/engine"
-	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/checkpoint"
+	"github.com/rahadiangg/polymigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
 )
 
 // defaultPollInterval is the lag-poll cadence used when Options.PollInterval is
@@ -207,7 +207,7 @@ func (e *Engine) setupCheckpoint(ctx context.Context, opts *Options) error {
 				return fmt.Errorf("cannot resume run %q: %w (start a fresh migration)", opts.RunID, engine.ErrChangeStreamHistoryLost)
 			}
 			if prev.Phase == string(engine.PhaseDone) {
-				return fmt.Errorf("run %q already completed successfully; clear its checkpoint (mm checkpoint clear) or use a new --run-id to migrate again", opts.RunID)
+				return fmt.Errorf("run %q already completed successfully; clear its checkpoint (poly checkpoint clear) or use a new --run-id to migrate again", opts.RunID)
 			}
 			applyResume(opts, prev)
 			state = prev
@@ -250,7 +250,7 @@ func applyResume(opts *Options, prev checkpoint.State) {
 	// A LIVE resume is only safe to fast-path (skip completed collections, resume
 	// in-progress ones) when there is a saved CDC token: the change stream then
 	// resumes from that token and covers every change since — including changes to
-	// the completed collections that happened while mm was down. Without a token
+	// the completed collections that happened while poly was down. Without a token
 	// (the snapshot phase never finished and CDC never checkpointed), a resumed
 	// stream would start from "now" and miss the downtime changes to the skipped
 	// collections. So in that case do NOT skip/resume snapshot state — re-copy

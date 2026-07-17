@@ -26,7 +26,7 @@ func newStatusCmd() *cobra.Command {
 			"local mirror is used, which may lag.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if runID == "" {
-				return fmt.Errorf("--run-id is required (see the run id printed by `mm migrate`)")
+				return fmt.Errorf("--run-id is required (see the run id printed by `poly migrate`)")
 			}
 			ctx, cancel := contextWithTimeout(cmd.Context(), 20*time.Second)
 			defer cancel()

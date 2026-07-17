@@ -161,3 +161,26 @@ func TestAnalyzeIntegration(t *testing.T) {
 		t.Errorf("setName = %q", info.SetName)
 	}
 }
+
+func TestLiveCDCDriverBug(t *testing.T) {
+	tests := []struct {
+		name   string
+		flavor Flavor
+		topo   TopologyKind
+		want   bool
+	}{
+		{"dds sharded cluster => blocked", FlavorHuaweiDDS, TopologySharded, true},
+		{"dds replica set => fine", FlavorHuaweiDDS, TopologyReplicaSet, false},
+		{"community sharded => fine", FlavorMongoDB, TopologySharded, false},
+		{"atlas sharded => fine", FlavorAtlas, TopologySharded, false},
+		{"percona replica set => fine", FlavorPercona, TopologyReplicaSet, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := ServerInfo{Flavor: tt.flavor, Topology: tt.topo}
+			if got := info.LiveCDCDriverBug(); got != tt.want {
+				t.Errorf("LiveCDCDriverBug() = %v want %v", got, tt.want)
+			}
+		})
+	}
+}

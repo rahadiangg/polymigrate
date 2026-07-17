@@ -1,5 +1,5 @@
 // Package checkpoint persists migration progress so a run can resume after the
-// source, destination, or the mm process itself dies. A checkpoint records the
+// source, destination, or the poly process itself dies. A checkpoint records the
 // per-namespace snapshot progress and the last APPLIED change-stream resume
 // token; on resume the copier skips completed collections and continues an
 // in-progress one from its last _id, and the tailer resumes the change stream

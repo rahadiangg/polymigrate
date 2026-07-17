@@ -7,8 +7,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/weefer/mongomigrate/internal/cdc"
-	"github.com/weefer/mongomigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/cdc"
+	"github.com/rahadiangg/polymigrate/internal/engine"
 )
 
 func init() {
@@ -48,6 +48,9 @@ func newTailCmd() *cobra.Command {
 
 			if !eps.src.Info.SupportsChangeStreams {
 				return fmt.Errorf("source %s does not support change streams", eps.src.Info.String())
+			}
+			if eps.src.Info.LiveCDCDriverBug() {
+				return fmt.Errorf("source %s: live CDC from a Huawei DDS sharded cluster hits a known MongoDB driver change-stream crash; tail a DDS replica set instead, or use `poly migrate --mode snapshot`", eps.src.Info.String())
 			}
 
 			nss, err := resolveNamespaces(ctx, eps.src, cfg, log)

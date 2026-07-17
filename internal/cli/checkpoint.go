@@ -8,18 +8,18 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/weefer/mongomigrate/internal/checkpoint"
-	"github.com/weefer/mongomigrate/internal/config"
-	"github.com/weefer/mongomigrate/internal/mongox"
+	"github.com/rahadiangg/polymigrate/internal/checkpoint"
+	"github.com/rahadiangg/polymigrate/internal/config"
+	"github.com/rahadiangg/polymigrate/internal/mongox"
 )
 
 // defaultCheckpointDir is where the local file mirror of checkpoints lives.
-const defaultCheckpointDir = ".mm-checkpoints"
+const defaultCheckpointDir = ".poly-checkpoints"
 
 // buildCheckpointStore returns a composite store that writes the destination
 // (authoritative, co-located with the data) and a local file mirror (fast,
 // survives loss of the destination). dst may be nil, in which case only the file
-// store is used (e.g. for `mm status` without connecting).
+// store is used (e.g. for `poly status` without connecting).
 func buildCheckpointStore(dst *mongox.Client, dir string) checkpoint.Store {
 	file := checkpoint.NewFileStore(dir)
 	if dst == nil {
@@ -50,7 +50,7 @@ func configHash(cfg config.Config) string {
 // defaultRunID derives a stable, human-recognisable run id from the configuration
 // so a bare re-run of the same migration finds its checkpoint.
 func defaultRunID(cfg config.Config) string {
-	return "mm-" + configHash(cfg)[:12]
+	return "poly-" + configHash(cfg)[:12]
 }
 
 // inspectStore builds the store used by `status` and `checkpoint clear`. When a

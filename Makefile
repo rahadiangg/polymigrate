@@ -1,7 +1,7 @@
-# mongomigrate — build and test targets
+# polymigrate — build and test targets
 
-BINARY  := mm
-PKG     := github.com/weefer/mongomigrate
+BINARY  := poly
+PKG     := github.com/rahadiangg/polymigrate
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -15,10 +15,10 @@ LDFLAGS := -s -w \
 all: vet test build
 
 build:
-	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/mm
+	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/poly
 
 install:
-	go install -trimpath -ldflags "$(LDFLAGS)" ./cmd/mm
+	go install -trimpath -ldflags "$(LDFLAGS)" ./cmd/poly
 
 test:
 	go test ./... -count=1
@@ -40,7 +40,7 @@ tidy:
 	go mod tidy
 
 # Integration tests require two reachable MongoDB replica sets; see the
-# MM_SRC_URI / MM_DST_URI env vars consumed by the //go:build integration tests.
+# POLY_SRC_URI / POLY_DST_URI env vars consumed by the //go:build integration tests.
 integration:
 	go test ./... -count=1 -tags=integration
 

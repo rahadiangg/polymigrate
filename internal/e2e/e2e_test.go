@@ -1,7 +1,7 @@
 //go:build integration
 
 // Package e2e drives the whole tool against two real MongoDB replica sets. Run
-// with: MM_SRC_URI=... MM_DST_URI=... go test -tags=integration ./internal/e2e/...
+// with: POLY_SRC_URI=... POLY_DST_URI=... go test -tags=integration ./internal/e2e/...
 //
 // The two endpoints must be distinct replica sets (change streams require one).
 // The test seeds the source itself, so any empty pair of clusters works. See
@@ -18,21 +18,21 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/weefer/mongomigrate/internal/cdc"
-	"github.com/weefer/mongomigrate/internal/copier"
-	"github.com/weefer/mongomigrate/internal/engine"
-	"github.com/weefer/mongomigrate/internal/logx"
-	"github.com/weefer/mongomigrate/internal/migrate"
-	"github.com/weefer/mongomigrate/internal/mongox"
-	"github.com/weefer/mongomigrate/internal/namespace"
-	"github.com/weefer/mongomigrate/internal/progress"
-	"github.com/weefer/mongomigrate/internal/verify"
+	"github.com/rahadiangg/polymigrate/internal/cdc"
+	"github.com/rahadiangg/polymigrate/internal/copier"
+	"github.com/rahadiangg/polymigrate/internal/engine"
+	"github.com/rahadiangg/polymigrate/internal/logx"
+	"github.com/rahadiangg/polymigrate/internal/migrate"
+	"github.com/rahadiangg/polymigrate/internal/mongox"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/progress"
+	"github.com/rahadiangg/polymigrate/internal/verify"
 )
 
 func uris(t *testing.T) (string, string) {
-	src, dst := os.Getenv("MM_SRC_URI"), os.Getenv("MM_DST_URI")
+	src, dst := os.Getenv("POLY_SRC_URI"), os.Getenv("POLY_DST_URI")
 	if src == "" || dst == "" {
-		t.Skip("set MM_SRC_URI and MM_DST_URI to run e2e tests")
+		t.Skip("set POLY_SRC_URI and POLY_DST_URI to run e2e tests")
 	}
 	return src, dst
 }
@@ -106,6 +106,19 @@ func TestSnapshotAndVerify(t *testing.T) {
 	}
 }
 
+// cdcTimeout is the CDC catch-up deadline, overridable via POLY_CDC_WAIT (e.g.
+// "90s"). Sharded clusters (Huawei DDS cluster, mongos) delay change events by
+// the periodic no-op-writer interval (~10s) because mongos must advance every
+// shard's cluster time before emitting an event, so the RS default is too tight.
+func cdcTimeout(def time.Duration) time.Duration {
+	if v := os.Getenv("POLY_CDC_WAIT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
 func TestLiveCDC(t *testing.T) {
 	srcURI, dstURI := uris(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -145,7 +158,7 @@ func TestLiveCDC(t *testing.T) {
 	}
 
 	// Wait for the tailer to drain the 301 events.
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(cdcTimeout(30 * time.Second))
 	for {
 		s := tl.Stats()
 		if s.Applied >= 301 && s.Buffered == 0 {

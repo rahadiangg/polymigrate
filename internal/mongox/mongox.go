@@ -20,7 +20,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
-	"github.com/weefer/mongomigrate/internal/namespace"
+	"github.com/rahadiangg/polymigrate/internal/namespace"
 )
 
 // TopologyKind classifies the deployment shape.
@@ -63,6 +63,18 @@ func (s ServerInfo) String() string {
 	return fmt.Sprintf("%s %s (%s, changeStreams=%v)", s.Flavor, s.Version, s.Topology, s.SupportsChangeStreams)
 }
 
+// LiveCDCDriverBug reports whether opening a live change stream against this
+// deployment triggers the known mongo-driver crash. It is true only for a
+// Huawei DDS *sharded cluster* source: the driver's change-stream reader panics
+// (nil-pointer in ChangeStream.loopNext) against a DDS mongos a few seconds
+// after events start flowing. DDS replica-set sources are unaffected, and the
+// snapshot path works for clusters. See README "Known issue" for the root cause.
+// The server otherwise reports change streams as supported, so this is a
+// separate guard from SupportsChangeStreams.
+func (s ServerInfo) LiveCDCDriverBug() bool {
+	return s.Flavor == FlavorHuaweiDDS && s.Topology == TopologySharded
+}
+
 // Client wraps a connected *mongo.Client along with its origin URI and, once
 // discovered, its ServerInfo.
 type Client struct {
@@ -90,7 +102,7 @@ func Connect(ctx context.Context, uri string, co ConnectOptions) (*Client, error
 		co.ConnectTimeout = 15 * time.Second
 	}
 	if co.AppName == "" {
-		co.AppName = "mongomigrate"
+		co.AppName = "polymigrate"
 	}
 
 	opts := options.Client().
