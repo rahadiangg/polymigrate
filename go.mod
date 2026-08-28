@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	github.com/spf13/cobra v1.10.2
-	go.mongodb.org/mongo-driver/v2 v2.8.0
+	go.mongodb.org/mongo-driver/v2 v2.8.1
 	gopkg.in/yaml.v3 v3.0.1
 )
 
